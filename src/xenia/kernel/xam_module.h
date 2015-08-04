@@ -10,8 +10,7 @@
 #ifndef XENIA_KERNEL_XAM_H_
 #define XENIA_KERNEL_XAM_H_
 
-#include "xenia/common.h"
-#include "xenia/export_resolver.h"
+#include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/objects/xkernel_module.h"
 #include "xenia/kernel/xam_ordinals.h"
 
@@ -23,8 +22,20 @@ class XamModule : public XKernelModule {
   XamModule(Emulator* emulator, KernelState* kernel_state);
   virtual ~XamModule();
 
-  static void RegisterExportTable(ExportResolver* export_resolver);
+  static void RegisterExportTable(xe::cpu::ExportResolver* export_resolver);
+
+  struct LoaderData {
+    uint32_t launch_data_ptr = 0;
+    uint32_t launch_data_size = 0;
+    uint32_t launch_flags = 0;
+    std::string launch_path;  // Full path to next xex
+  };
+
+  const LoaderData& loader_data() const { return loader_data_; }
+  LoaderData& loader_data() { return loader_data_; }
+
  private:
+  LoaderData loader_data_;
 };
 
 }  // namespace kernel

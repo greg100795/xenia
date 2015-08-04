@@ -7,7 +7,7 @@
  ******************************************************************************
  */
 
-#include "xenia/common.h"
+#include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam_private.h"
@@ -17,17 +17,18 @@ namespace xe {
 namespace kernel {
 
 // TODO(benvanik): actually check to see if these are the same.
-void xeVdQueryVideoMode(X_VIDEO_MODE* video_mode);
-SHIM_CALL XGetVideoMode_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t video_mode_ptr = SHIM_GET_ARG_32(0);
-  X_VIDEO_MODE* video_mode = (X_VIDEO_MODE*)SHIM_MEM_ADDR(video_mode_ptr);
-  xeVdQueryVideoMode(video_mode);
+void VdQueryVideoMode(pointer_t<X_VIDEO_MODE> video_mode);
+
+void XGetVideoMode(pointer_t<X_VIDEO_MODE> video_mode) {
+  VdQueryVideoMode(std::move(video_mode));
 }
+DECLARE_XAM_EXPORT(XGetVideoMode, ExportTag::kVideo | ExportTag::kSketchy);
+
+dword_result_t XGetVideoCapabilities() { return 0; }
+DECLARE_XAM_EXPORT(XGetVideoCapabilities, ExportTag::kVideo | ExportTag::kStub);
 
 }  // namespace kernel
 }  // namespace xe
 
-void xe::kernel::xam::RegisterVideoExports(ExportResolver* export_resolver,
-                                           KernelState* state) {
-  SHIM_SET_MAPPING("xam.xex", XGetVideoMode, state);
-}
+void xe::kernel::xam::RegisterVideoExports(
+    xe::cpu::ExportResolver* export_resolver, KernelState* kernel_state) {}

@@ -10,12 +10,12 @@
 #ifndef XENIA_COMPILER_COMPILER_PASS_H_
 #define XENIA_COMPILER_COMPILER_PASS_H_
 
+#include "xenia/base/arena.h"
 #include "xenia/cpu/hir/hir_builder.h"
-#include "poly/arena.h"
 
 namespace xe {
 namespace cpu {
-class Runtime;
+class Processor;
 }  // namespace cpu
 }  // namespace xe
 
@@ -30,15 +30,15 @@ class CompilerPass {
   CompilerPass();
   virtual ~CompilerPass();
 
-  virtual int Initialize(Compiler* compiler);
+  virtual bool Initialize(Compiler* compiler);
 
-  virtual int Run(hir::HIRBuilder* builder) = 0;
-
- protected:
-  poly::Arena* scratch_arena() const;
+  virtual bool Run(hir::HIRBuilder* builder) = 0;
 
  protected:
-  Runtime* runtime_;
+  Arena* scratch_arena() const;
+
+ protected:
+  Processor* processor_;
   Compiler* compiler_;
 };
 

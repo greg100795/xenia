@@ -19,10 +19,10 @@ namespace cpu {
 
 class RawModule : public Module {
  public:
-  RawModule(Runtime* runtime);
+  RawModule(Processor* processor);
   ~RawModule() override;
 
-  int LoadFile(uint32_t base_address, const std::wstring& path);
+  bool LoadFile(uint32_t base_address, const std::wstring& path);
 
   const std::string& name() const override { return name_; }
 

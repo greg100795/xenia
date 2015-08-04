@@ -10,7 +10,9 @@
 #ifndef XENIA_GPU_UCODE_H_
 #define XENIA_GPU_UCODE_H_
 
-#include "xenia/common.h"
+#include <cstdint>
+
+#include "xenia/base/platform.h"
 
 namespace xe {
 namespace gpu {
@@ -27,10 +29,10 @@ namespace ucode {
   __pragma(pack(push, 1)) union name##_s value __pragma(pack(pop)); \
   typedef union name##_s name;
 #else
-#define XEPACKEDSTRUCT(name, value) struct __attribute__((packed)) name
-#define XEPACKEDSTRUCTANONYMOUS(value) struct __attribute__((packed))
-#define XEPACKEDUNION(name, value) union __attribute__((packed)) name
-#endif  // MSVC
+#define XEPACKEDSTRUCT(name, value) struct __attribute__((packed)) name value;
+#define XEPACKEDSTRUCTANONYMOUS(value) struct __attribute__((packed)) value;
+#define XEPACKEDUNION(name, value) union __attribute__((packed)) name value;
+#endif  // XE_PLATFORM_WIN32
 
 // Closest AMD doc:
 // http://developer.amd.com/wordpress/media/2012/10/R600_Instruction_Set_Architecture.pdf

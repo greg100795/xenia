@@ -12,13 +12,14 @@
 
 #include <vector>
 
+#include "xenia/base/arena.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/cpu/hir/block.h"
 #include "xenia/cpu/hir/instr.h"
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/hir/opcodes.h"
 #include "xenia/cpu/hir/value.h"
-#include "poly/arena.h"
-#include "poly/string_buffer.h"
+#include "xenia/cpu/mmio_handler.h"
 
 namespace xe {
 namespace cpu {
@@ -34,12 +35,12 @@ class HIRBuilder {
   virtual ~HIRBuilder();
 
   virtual void Reset();
-  virtual int Finalize();
+  virtual bool Finalize();
 
-  void Dump(poly::StringBuffer* str);
+  void Dump(StringBuffer* str);
   void AssertNoCycles();
 
-  poly::Arena* arena() const { return arena_; }
+  Arena* arena() const { return arena_; }
 
   uint32_t attributes() const { return attributes_; }
   void set_attributes(uint32_t value) { attributes_ = value; }
@@ -59,20 +60,21 @@ class HIRBuilder {
   void ResetLabelTags();
 
   void AddEdge(Block* src, Block* dest, uint32_t flags);
+  void RemoveEdge(Block* src, Block* dest);
+  void RemoveEdge(Edge* edge);
+  void RemoveBlock(Block* block);
   void MergeAdjacentBlocks(Block* left, Block* right);
 
   // static allocations:
   // Value* AllocStatic(size_t length);
 
-  void Comment(const char* format, ...);
+  void Comment(const char* value);
+  void Comment(const StringBuffer& value);
+  void CommentFormat(const char* format, ...);
 
   void Nop();
 
-  void SourceOffset(uint64_t offset);
-  void TraceSource(uint64_t offset);
-  void TraceSource(uint64_t offset, uint8_t index, Value* value);
-  void TraceSource(uint64_t offset, uint8_t index_0, Value* value_0,
-                   uint8_t index_1, Value* value_1);
+  void SourceOffset(uint32_t offset);
 
   // trace info/etc
   void DebugBreak();
@@ -81,20 +83,20 @@ class HIRBuilder {
   void Trap(uint16_t trap_code = 0);
   void TrapTrue(Value* cond, uint16_t trap_code = 0);
 
-  void Call(FunctionInfo* symbol_info, uint32_t call_flags = 0);
+  void Call(FunctionInfo* symbol_info, uint16_t call_flags = 0);
   void CallTrue(Value* cond, FunctionInfo* symbol_info,
-                uint32_t call_flags = 0);
-  void CallIndirect(Value* value, uint32_t call_flags = 0);
-  void CallIndirectTrue(Value* cond, Value* value, uint32_t call_flags = 0);
+                uint16_t call_flags = 0);
+  void CallIndirect(Value* value, uint16_t call_flags = 0);
+  void CallIndirectTrue(Value* cond, Value* value, uint16_t call_flags = 0);
   void CallExtern(FunctionInfo* symbol_info);
   void Return();
   void ReturnTrue(Value* cond);
   void SetReturnAddress(Value* value);
 
-  void Branch(Label* label, uint32_t branch_flags = 0);
-  void Branch(Block* block, uint32_t branch_flags = 0);
-  void BranchTrue(Value* cond, Label* label, uint32_t branch_flags = 0);
-  void BranchFalse(Value* cond, Label* label, uint32_t branch_flags = 0);
+  void Branch(Label* label, uint16_t branch_flags = 0);
+  void Branch(Block* block, uint16_t branch_flags = 0);
+  void BranchTrue(Value* cond, Label* label, uint16_t branch_flags = 0);
+  void BranchFalse(Value* cond, Label* label, uint16_t branch_flags = 0);
 
   // phi type_name, Block* b1, Value* v1, Block* b2, Value* v2, etc
 
@@ -110,17 +112,25 @@ class HIRBuilder {
   Value* VectorConvertF2I(Value* value, uint32_t arithmetic_flags = 0);
 
   Value* LoadZero(TypeName type);
-  Value* LoadConstant(int8_t value);
-  Value* LoadConstant(uint8_t value);
-  Value* LoadConstant(int16_t value);
-  Value* LoadConstant(uint16_t value);
-  Value* LoadConstant(int32_t value);
-  Value* LoadConstant(uint32_t value);
-  Value* LoadConstant(int64_t value);
-  Value* LoadConstant(uint64_t value);
-  Value* LoadConstant(float value);
-  Value* LoadConstant(double value);
-  Value* LoadConstant(const vec128_t& value);
+  Value* LoadZeroInt8() { return LoadZero(INT8_TYPE); }
+  Value* LoadZeroInt16() { return LoadZero(INT16_TYPE); }
+  Value* LoadZeroInt32() { return LoadZero(INT32_TYPE); }
+  Value* LoadZeroInt64() { return LoadZero(INT64_TYPE); }
+  Value* LoadZeroFloat32() { return LoadZero(FLOAT32_TYPE); }
+  Value* LoadZeroFloat64() { return LoadZero(FLOAT64_TYPE); }
+  Value* LoadZeroVec128() { return LoadZero(VEC128_TYPE); }
+
+  Value* LoadConstantInt8(int8_t value);
+  Value* LoadConstantUint8(uint8_t value);
+  Value* LoadConstantInt16(int16_t value);
+  Value* LoadConstantUint16(uint16_t value);
+  Value* LoadConstantInt32(int32_t value);
+  Value* LoadConstantUint32(uint32_t value);
+  Value* LoadConstantInt64(int64_t value);
+  Value* LoadConstantUint64(uint64_t value);
+  Value* LoadConstantFloat32(float value);
+  Value* LoadConstantFloat64(double value);
+  Value* LoadConstantVec128(const vec128_t& value);
 
   Value* LoadVectorShl(Value* sh);
   Value* LoadVectorShr(Value* sh);
@@ -134,8 +144,12 @@ class HIRBuilder {
   Value* LoadContext(size_t offset, TypeName type);
   void StoreContext(size_t offset, Value* value);
 
+  Value* LoadMmio(cpu::MMIORange* mmio_range, uint32_t address, TypeName type);
+  void StoreMmio(cpu::MMIORange* mmio_range, uint32_t address, Value* value);
+
   Value* Load(Value* address, TypeName type, uint32_t load_flags = 0);
   void Store(Value* address, Value* value, uint32_t store_flags = 0);
+  void Memset(Value* address, Value* value, Value* length);
   void Prefetch(Value* address, size_t length, uint32_t prefetch_flags = 0);
 
   Value* Max(Value* value1, Value* value2);
@@ -157,8 +171,6 @@ class HIRBuilder {
   Value* CompareULE(Value* value1, Value* value2);
   Value* CompareUGT(Value* value1, Value* value2);
   Value* CompareUGE(Value* value1, Value* value2);
-  Value* DidCarry(Value* value);
-  Value* DidOverflow(Value* value);
   Value* DidSaturate(Value* value);
   Value* VectorCompareEQ(Value* value1, Value* value2, TypeName part_type);
   Value* VectorCompareSGT(Value* value1, Value* value2, TypeName part_type);
@@ -222,16 +234,13 @@ class HIRBuilder {
   Value* Pack(Value* value1, Value* value2, uint32_t pack_flags = 0);
   Value* Unpack(Value* value, uint32_t pack_flags = 0);
 
-  Value* CompareExchange(Value* address, Value* compare_value,
-                         Value* exchange_value);
   Value* AtomicExchange(Value* address, Value* new_value);
   Value* AtomicAdd(Value* address, Value* value);
   Value* AtomicSub(Value* address, Value* value);
 
  protected:
-  void DumpValue(poly::StringBuffer* str, Value* value);
-  void DumpOp(poly::StringBuffer* str, OpcodeSignatureType sig_type,
-              Instr::Op* op);
+  void DumpValue(StringBuffer* str, Value* value);
+  void DumpOp(StringBuffer* str, OpcodeSignatureType sig_type, Instr::Op* op);
 
   Value* AllocValue(TypeName type = INT64_TYPE);
   Value* CloneValue(Value* source);
@@ -246,7 +255,7 @@ class HIRBuilder {
                          TypeName part_type);
 
  protected:
-  poly::Arena* arena_;
+  Arena* arena_;
 
   uint32_t attributes_;
 

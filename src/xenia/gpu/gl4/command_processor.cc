@@ -11,14 +11,16 @@
 
 #include <algorithm>
 
-#include "poly/logging.h"
-#include "poly/math.h"
-#include "xenia/gpu/gl4/gl4_gpu-private.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/gpu/gl4/gl4_gpu_flags.h"
 #include "xenia/gpu/gl4/gl4_graphics_system.h"
-#include "xenia/gpu/gpu-private.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/sampler_info.h"
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/emulator.h"
+#include "xenia/profiling.h"
 
 #include "third_party/xxhash/xxhash.h"
 
@@ -27,8 +29,6 @@ namespace gpu {
 namespace gl4 {
 
 using namespace xe::gpu::xenos;
-
-extern "C" GLEWContext* glewGetContext();
 
 const GLuint kAnyTarget = UINT_MAX;
 
@@ -57,53 +57,42 @@ CommandProcessor::CommandProcessor(GL4GraphicsSystem* graphics_system)
       trace_state_(TraceState::kDisabled),
       worker_running_(true),
       swap_mode_(SwapMode::kNormal),
-      time_base_(0),
       counter_(0),
       primary_buffer_ptr_(0),
       primary_buffer_size_(0),
       read_ptr_index_(0),
       read_ptr_update_freq_(0),
       read_ptr_writeback_ptr_(0),
-      write_ptr_index_event_(CreateEvent(NULL, FALSE, FALSE, NULL)),
+      write_ptr_index_event_(xe::threading::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0),
       bin_select_(0xFFFFFFFFull),
       bin_mask_(0xFFFFFFFFull),
-      has_bindless_vbos_(false),
       active_vertex_shader_(nullptr),
       active_pixel_shader_(nullptr),
       active_framebuffer_(nullptr),
       last_framebuffer_texture_(0),
-      last_swap_width_(0),
-      last_swap_height_(0),
       point_list_geometry_program_(0),
       rect_list_geometry_program_(0),
       quad_list_geometry_program_(0),
       draw_index_count_(0),
       draw_batcher_(graphics_system_->register_file()),
-      scratch_buffer_(kScratchBufferCapacity, kScratchBufferAlignment) {
-  LARGE_INTEGER perf_counter;
-  QueryPerformanceCounter(&perf_counter);
-  time_base_ = perf_counter.QuadPart;
-}
+      scratch_buffer_(kScratchBufferCapacity, kScratchBufferAlignment) {}
 
-CommandProcessor::~CommandProcessor() { CloseHandle(write_ptr_index_event_); }
+CommandProcessor::~CommandProcessor() = default;
 
-uint64_t CommandProcessor::QueryTime() {
-  LARGE_INTEGER perf_counter;
-  QueryPerformanceCounter(&perf_counter);
-  return perf_counter.QuadPart - time_base_;
-}
-
-bool CommandProcessor::Initialize(std::unique_ptr<GLContext> context) {
+bool CommandProcessor::Initialize(
+    std::unique_ptr<xe::ui::GraphicsContext> context) {
   context_ = std::move(context);
 
   worker_running_ = true;
-  worker_thread_ = std::thread([this]() {
-    poly::threading::set_name("GL4 Worker");
-    xe::Profiler::ThreadEnter("GL4 Worker");
-    WorkerMain();
-    xe::Profiler::ThreadExit();
-  });
+  worker_thread_ = kernel::object_ref<kernel::XHostThread>(
+      new kernel::XHostThread(graphics_system_->emulator()->kernel_state(),
+                              128 * 1024, 0, [this]() {
+                                WorkerThreadMain();
+                                return 0;
+                              }));
+  worker_thread_->set_name("GL4 Worker");
+  worker_thread_->Create();
 
   return true;
 }
@@ -112,14 +101,9 @@ void CommandProcessor::Shutdown() {
   EndTracing();
 
   worker_running_ = false;
-  SetEvent(write_ptr_index_event_);
-  worker_thread_.join();
-
-  all_pipelines_.clear();
-  all_shaders_.clear();
-  shader_cache_.clear();
-
-  context_.reset();
+  write_ptr_index_event_->Set();
+  worker_thread_->Wait(0, 0, 0, nullptr);
+  worker_thread_.reset();
 }
 
 void CommandProcessor::RequestFrameTrace(const std::wstring& root_path) {
@@ -159,17 +143,36 @@ void CommandProcessor::EndTracing() {
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
   if (pending_fns_.empty() &&
-      worker_thread_.get_id() == std::this_thread::get_id()) {
+      kernel::XThread::IsInThread(worker_thread_.get())) {
     fn();
   } else {
     pending_fns_.push(std::move(fn));
   }
 }
 
-void CommandProcessor::WorkerMain() {
+void CommandProcessor::ClearCaches() {
+  texture_cache()->Clear();
+
+  for (auto& cached_framebuffer : cached_framebuffers_) {
+    glDeleteFramebuffers(1, &cached_framebuffer.framebuffer);
+  }
+  cached_framebuffers_.clear();
+
+  for (auto& cached_color_render_target : cached_color_render_targets_) {
+    glDeleteTextures(1, &cached_color_render_target.texture);
+  }
+  cached_color_render_targets_.clear();
+
+  for (auto& cached_depth_render_target : cached_depth_render_targets_) {
+    glDeleteTextures(1, &cached_depth_render_target.texture);
+  }
+  cached_depth_render_targets_.clear();
+}
+
+void CommandProcessor::WorkerThreadMain() {
   context_->MakeCurrent();
   if (!SetupGL()) {
-    PFATAL("Unable to setup command processor GL state");
+    XEFATAL("Unable to setup command processor GL state");
     return;
   }
 
@@ -186,19 +189,20 @@ void CommandProcessor::WorkerMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
-      // PrepareForWait();
+      PrepareForWait();
       do {
         // TODO(benvanik): if we go longer than Nms, switch to waiting?
         // It'll keep us from burning power.
         // const int wait_time_ms = 5;
-        // WaitForSingleObject(write_ptr_index_event_, wait_time_ms);
-        SwitchToThread();
-        MemoryBarrier();
+        // xe::threading::Wait(write_ptr_index_event_.get(), true,
+        //                     std::chrono::milliseconds(wait_time_ms));
+        xe::threading::MaybeYield();
         write_ptr_index = write_ptr_index_.load();
-      } while (pending_fns_.empty() && (write_ptr_index == 0xBAADF00D ||
-                                        read_ptr_index_ == write_ptr_index));
-      // ReturnFromWait();
-      if (!pending_fns_.empty()) {
+      } while (worker_running_ && pending_fns_.empty() &&
+               (write_ptr_index == 0xBAADF00D ||
+                read_ptr_index_ == write_ptr_index));
+      ReturnFromWait();
+      if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
     }
@@ -211,35 +215,30 @@ void CommandProcessor::WorkerMain() {
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
-      poly::store_and_swap<uint32_t>(
+      xe::store_and_swap<uint32_t>(
           memory_->TranslatePhysical(read_ptr_writeback_ptr_), read_ptr_index_);
     }
   }
 
   ShutdownGL();
-  context_->ClearCurrent();
 }
 
 bool CommandProcessor::SetupGL() {
-  if (FLAGS_vendor_gl_extensions && GLEW_NV_vertex_buffer_unified_memory) {
-    has_bindless_vbos_ = true;
-  }
-
   // Circular buffer holding scratch vertex/index data.
   if (!scratch_buffer_.Initialize()) {
-    PLOGE("Unable to initialize scratch buffer");
+    XELOGE("Unable to initialize scratch buffer");
     return false;
   }
 
   // Command buffer.
   if (!draw_batcher_.Initialize(&scratch_buffer_)) {
-    PLOGE("Unable to initialize command buffer");
+    XELOGE("Unable to initialize command buffer");
     return false;
   }
 
   // Texture cache that keeps track of any textures/samplers used.
   if (!texture_cache_.Initialize(memory_, &scratch_buffer_)) {
-    PLOGE("Unable to initialize texture cache");
+    XELOGE("Unable to initialize texture cache");
     return false;
   }
 
@@ -262,8 +261,8 @@ bool CommandProcessor::SetupGL() {
       "  vec4 o[16];\n"
       "};\n"
       "\n"
-      "layout(location = 0) in VertexData in_vtx[];\n"
-      "layout(location = 0) out VertexData out_vtx;\n";
+      "layout(location = 1) in VertexData in_vtx[];\n"
+      "layout(location = 1) out VertexData out_vtx;\n";
   // TODO(benvanik): fetch default point size from register and use that if
   //     the VS doesn't write oPointSize.
   // TODO(benvanik): clamp to min/max.
@@ -291,7 +290,7 @@ bool CommandProcessor::SetupGL() {
   std::string rect_list_shader =
       geometry_header +
       "layout(triangles) in;\n"
-      "layout(triangle_strip, max_vertices = 4) out;\n"
+      "layout(triangle_strip, max_vertices = 6) out;\n"
       "void main() {\n"
       // Most games use the left-aligned form.
       "  bool left_aligned = gl_in[0].gl_Position.x == \n"
@@ -314,6 +313,15 @@ bool CommandProcessor::SetupGL() {
       "    gl_PointSize = gl_in[2].gl_PointSize;\n"
       "    out_vtx = in_vtx[2];\n"
       "    EmitVertex();\n"
+      "    EndPrimitive();\n"
+      "    gl_Position = gl_in[2].gl_Position;\n"
+      "    gl_PointSize = gl_in[2].gl_PointSize;\n"
+      "    out_vtx = in_vtx[2];\n"
+      "    EmitVertex();\n"
+      "    gl_Position = gl_in[1].gl_Position;\n"
+      "    gl_PointSize = gl_in[1].gl_PointSize;\n"
+      "    out_vtx = in_vtx[1];\n"
+      "    EmitVertex();\n"
       "    gl_Position = \n"
       "       (gl_in[1].gl_Position + gl_in[2].gl_Position) - \n"
       "       gl_in[0].gl_Position;\n"
@@ -323,6 +331,7 @@ bool CommandProcessor::SetupGL() {
       "          in_vtx[2].o[i];\n"
       "    }\n"
       "    EmitVertex();\n"
+      "    EndPrimitive();\n"
       "  } else {\n"
       //  0 ------ 1
       //  | -      |
@@ -337,6 +346,19 @@ bool CommandProcessor::SetupGL() {
       "    gl_PointSize = gl_in[1].gl_PointSize;\n"
       "    out_vtx = in_vtx[1];\n"
       "    EmitVertex();\n"
+      "    gl_Position = gl_in[2].gl_Position;\n"
+      "    gl_PointSize = gl_in[2].gl_PointSize;\n"
+      "    out_vtx = in_vtx[2];\n"
+      "    EmitVertex();\n"
+      "    EndPrimitive();\n"
+      "    gl_Position = gl_in[0].gl_Position;\n"
+      "    gl_PointSize = gl_in[0].gl_PointSize;\n"
+      "    out_vtx = in_vtx[0];\n"
+      "    EmitVertex();\n"
+      "    gl_Position = gl_in[2].gl_Position;\n"
+      "    gl_PointSize = gl_in[2].gl_PointSize;\n"
+      "    out_vtx = in_vtx[2];\n"
+      "    EmitVertex();\n"
       "    gl_Position = gl_in[0].gl_Position + (gl_in[2].gl_Position - \n"
       "        gl_in[1].gl_Position);\n"
       "    gl_PointSize = gl_in[2].gl_PointSize;\n"
@@ -345,12 +367,8 @@ bool CommandProcessor::SetupGL() {
       "          in_vtx[2].o[i];\n"
       "    }\n"
       "    EmitVertex();\n"
-      "    gl_Position = gl_in[2].gl_Position;\n"
-      "    gl_PointSize = gl_in[2].gl_PointSize;\n"
-      "    out_vtx = in_vtx[2];\n"
-      "    EmitVertex();\n"
+      "    EndPrimitive();\n"
       "  }\n"
-      "  EndPrimitive();\n"
       "}\n";
   std::string quad_list_shader =
       geometry_header +
@@ -425,7 +443,7 @@ GLuint CommandProcessor::CreateGeometryProgram(const std::string& source) {
     info_log.resize(log_length - 1);
     glGetProgramInfoLog(program, log_length, &log_length,
                         const_cast<char*>(info_log.data()));
-    PLOGE("Unable to link program: %s", info_log.c_str());
+    XELOGE("Unable to link program: %s", info_log.c_str());
     glDeleteProgram(program);
     return 0;
   }
@@ -441,6 +459,12 @@ void CommandProcessor::ShutdownGL() {
   texture_cache_.Shutdown();
   draw_batcher_.Shutdown();
   scratch_buffer_.Shutdown();
+
+  all_pipelines_.clear();
+  all_shaders_.clear();
+  shader_cache_.clear();
+
+  context_.reset();
 }
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t page_count) {
@@ -455,7 +479,7 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr,
                                                   uint32_t block_size) {
   // CP_RB_RPTR_ADDR Ring Buffer Read Pointer Address 0x70C
   // ptr = RB_RPTR_ADDR, pointer to write back the address to.
-  read_ptr_writeback_ptr_ = (primary_buffer_ptr_ & ~0x1FFFFFFF) + ptr;
+  read_ptr_writeback_ptr_ = ptr;
   // CP_RB_CNTL Ring Buffer Control 0x704
   // block_size = RB_BLKSZ, number of quadwords read between updates of the
   //              read pointer.
@@ -464,12 +488,15 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr,
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
   write_ptr_index_ = value;
-  SetEvent(write_ptr_index_event_);
+  write_ptr_index_event_->Set();
 }
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile* regs = register_file_;
-  assert_true(index < RegisterFile::kRegisterCount);
+  if (index >= RegisterFile::kRegisterCount) {
+    XELOGW("CommandProcessor::WriteRegister index out of bounds: %d", index);
+    return;
+  }
 
   regs->values[index].u32 = value;
 
@@ -487,8 +514,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs->values[XE_GPU_REG_SCRATCH_ADDR].u32;
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      poly::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr),
-                                     value);
+      xe::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
     }
   }
 }
@@ -507,8 +533,8 @@ void CommandProcessor::MakeCoherent() {
 
   RegisterFile* regs = register_file_;
   auto status_host = regs->values[XE_GPU_REG_COHER_STATUS_HOST].u32;
-  auto base_host = regs->values[XE_GPU_REG_COHER_BASE_HOST].u32;
-  auto size_host = regs->values[XE_GPU_REG_COHER_SIZE_HOST].u32;
+  // auto base_host = regs->values[XE_GPU_REG_COHER_BASE_HOST].u32;
+  // auto size_host = regs->values[XE_GPU_REG_COHER_SIZE_HOST].u32;
 
   if (!(status_host & 0x80000000ul)) {
     return;
@@ -547,18 +573,51 @@ void CommandProcessor::ReturnFromWait() {
   }
 }
 
-void CommandProcessor::IssueSwap() {
-  IssueSwap(last_swap_width_, last_swap_height_);
-}
-
-void CommandProcessor::IssueSwap(uint32_t frontbuffer_width,
+void CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
+                                 uint32_t frontbuffer_width,
                                  uint32_t frontbuffer_height) {
-  if (!swap_handler_) {
+  SCOPE_profile_cpu_f("gpu");
+  if (!swap_request_handler_) {
     return;
   }
 
-  auto& regs = *register_file_;
-  SwapParameters swap_params;
+  // If there was a swap pending we drop it on the floor.
+  // This prevents the display from pulling the backbuffer out from under us.
+  // If we skip a lot then we may need to buffer more, but as the display
+  // thread should be fairly idle that shouldn't happen.
+  if (!FLAGS_vsync) {
+    std::lock_guard<xe::mutex> lock(swap_state_.mutex);
+    if (swap_state_.pending) {
+      swap_state_.pending = false;
+      // TODO(benvanik): frame skip counter.
+      XELOGW("Skipped frame!");
+    }
+  } else {
+    // Spin until no more pending swap.
+    while (true) {
+      {
+        std::lock_guard<xe::mutex> lock(swap_state_.mutex);
+        if (!swap_state_.pending) {
+          break;
+        }
+      }
+      xe::threading::MaybeYield();
+    }
+  }
+
+  // One-time initialization.
+  // TODO(benvanik): move someplace more sane?
+  if (!swap_state_.front_buffer_texture) {
+    std::lock_guard<xe::mutex> lock(swap_state_.mutex);
+    swap_state_.width = frontbuffer_width;
+    swap_state_.height = frontbuffer_height;
+    glCreateTextures(GL_TEXTURE_2D, 1, &swap_state_.front_buffer_texture);
+    glCreateTextures(GL_TEXTURE_2D, 1, &swap_state_.back_buffer_texture);
+    glTextureStorage2D(swap_state_.front_buffer_texture, 1, GL_RGBA8,
+                       swap_state_.width, swap_state_.height);
+    glTextureStorage2D(swap_state_.back_buffer_texture, 1, GL_RGBA8,
+                       swap_state_.width, swap_state_.height);
+  }
 
   // Lookup the framebuffer in the recently-resolved list.
   // TODO(benvanik): make this much more sophisticated.
@@ -566,20 +625,34 @@ void CommandProcessor::IssueSwap(uint32_t frontbuffer_width,
   // TODO(benvanik): handle dirty cases (resolved to sysmem, touched).
   // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
   // HACK: just use whatever our current framebuffer is.
-  swap_params.framebuffer_texture = last_framebuffer_texture_;
-  /*swap_params.framebuffer_texture = active_framebuffer_
+  GLuint framebuffer_texture = last_framebuffer_texture_;
+  /*GLuint framebuffer_texture = active_framebuffer_
                                         ? active_framebuffer_->color_targets[0]
                                         : last_framebuffer_texture_;*/
 
-  // Frontbuffer dimensions, if valid.
-  swap_params.x = 0;
-  swap_params.y = 0;
-  swap_params.width = frontbuffer_width ? frontbuffer_width : 1280;
-  swap_params.height = frontbuffer_height ? frontbuffer_height : 720;
+  // Copy the the given framebuffer to the current backbuffer.
+  Rect2D src_rect(0, 0, frontbuffer_width ? frontbuffer_width : 1280,
+                  frontbuffer_height ? frontbuffer_height : 720);
+  Rect2D dest_rect(0, 0, swap_state_.width, swap_state_.height);
+  reinterpret_cast<xe::ui::gl::GLContext*>(context_.get())
+      ->blitter()
+      ->CopyColorTexture2D(framebuffer_texture, src_rect,
+                           swap_state_.back_buffer_texture, dest_rect,
+                           GL_LINEAR);
 
-  PrepareForWait();
-  swap_handler_(swap_params);
-  ReturnFromWait();
+  // Need to finish to be sure the other context sees the right data.
+  // TODO(benvanik): prevent this? fences?
+  glFinish();
+
+  {
+    // Set pending so that the display will swap the next time it can.
+    std::lock_guard<xe::mutex> lock(swap_state_.mutex);
+    swap_state_.pending = true;
+  }
+
+  // Notify the display a swap is pending so that our changes are picked up.
+  // It does the actual front/back buffer swap.
+  swap_request_handler_();
 
   // Remove any dead textures, etc.
   texture_cache_.Scavenge();
@@ -592,7 +665,6 @@ class CommandProcessor::RingbufferReader {
       : membase_(membase),
         base_ptr_(base_ptr),
         ptr_mask_(ptr_mask),
-        start_ptr_(start_ptr),
         end_ptr_(end_ptr),
         ptr_(start_ptr),
         offset_(0) {}
@@ -601,14 +673,14 @@ class CommandProcessor::RingbufferReader {
   uint32_t offset() const { return offset_; }
   bool can_read() const { return ptr_ != end_ptr_; }
 
-  uint32_t Peek() { return poly::load_and_swap<uint32_t>(membase_ + ptr_); }
+  uint32_t Peek() { return xe::load_and_swap<uint32_t>(membase_ + ptr_); }
 
   void CheckRead(uint32_t words) {
     assert_true(ptr_ + words * sizeof(uint32_t) <= end_ptr_);
   }
 
   uint32_t Read() {
-    uint32_t value = poly::load_and_swap<uint32_t>(membase_ + ptr_);
+    uint32_t value = xe::load_and_swap<uint32_t>(membase_ + ptr_);
     Advance(1);
     return value;
   }
@@ -630,7 +702,6 @@ class CommandProcessor::RingbufferReader {
 
   uint32_t base_ptr_;
   uint32_t ptr_mask_;
-  uint32_t start_ptr_;
   uint32_t end_ptr_;
   uint32_t ptr_;
   uint32_t offset_;
@@ -688,8 +759,6 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(RingbufferReader* reader) {
-  RegisterFile* regs = register_file_;
-
   const uint32_t packet = reader->Read();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -887,7 +956,6 @@ bool CommandProcessor::ExecutePacketType3(RingbufferReader* reader,
 }
 
 bool CommandProcessor::ExecutePacketType3_ME_INIT(RingbufferReader* reader,
-
                                                   uint32_t packet,
                                                   uint32_t count) {
   // initialize CP's micro-engine
@@ -896,7 +964,6 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(RingbufferReader* reader,
 }
 
 bool CommandProcessor::ExecutePacketType3_NOP(RingbufferReader* reader,
-
                                               uint32_t packet, uint32_t count) {
   // skip N 32-bit words to get to the next packet
   // No-op, ignore some data.
@@ -905,7 +972,6 @@ bool CommandProcessor::ExecutePacketType3_NOP(RingbufferReader* reader,
 }
 
 bool CommandProcessor::ExecutePacketType3_INTERRUPT(RingbufferReader* reader,
-
                                                     uint32_t packet,
                                                     uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
@@ -921,29 +987,30 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(RingbufferReader* reader,
 }
 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(RingbufferReader* reader,
-
                                                   uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
-  PLOGI("XE_SWAP");
+  XELOGI("XE_SWAP");
 
   // Xenia-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
   // interrupt.
   // 63 words here, but only the first has any data.
+  uint32_t magic = reader->Read();
+  assert_true(magic == 'SWAP');
+
+  // TODO(benvanik): only swap frontbuffer ptr.
   uint32_t frontbuffer_ptr = reader->Read();
   uint32_t frontbuffer_width = reader->Read();
   uint32_t frontbuffer_height = reader->Read();
-  reader->Advance(count - 3);
-  last_swap_width_ = frontbuffer_width;
-  last_swap_height_ = frontbuffer_height;
+  reader->Advance(count - 4);
 
   // Ensure we issue any pending draws.
   draw_batcher_.Flush(DrawBatcher::FlushMode::kMakeCoherent);
 
   if (swap_mode_ == SwapMode::kNormal) {
-    IssueSwap(frontbuffer_width, frontbuffer_height);
+    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   }
 
   if (trace_writer_.is_open()) {
@@ -966,14 +1033,13 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(RingbufferReader* reader,
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(
     RingbufferReader* reader, uint32_t packet, uint32_t count) {
   // indirect buffer dispatch
-  uint32_t list_ptr = reader->Read();
+  uint32_t list_ptr = CpuToGpu(reader->Read());
   uint32_t list_length = reader->Read();
   ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
   return true;
 }
 
 bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(RingbufferReader* reader,
-
                                                        uint32_t packet,
                                                        uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
@@ -991,9 +1057,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(RingbufferReader* reader,
       // Memory.
       auto endianness = static_cast<Endian>(poll_reg_addr & 0x3);
       poll_reg_addr &= ~0x3;
-      value = poly::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
+      value = xe::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
       value = GpuSwap(value, endianness);
-      trace_writer_.WriteMemoryRead(poll_reg_addr, 4);
+      trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr), 4);
     } else {
       // Register.
       assert_true(poll_reg_addr < RegisterFile::kRegisterCount);
@@ -1035,14 +1101,15 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(RingbufferReader* reader,
         PrepareForWait();
         if (!FLAGS_vsync) {
           // User wants it fast and dangerous.
-          SwitchToThread();
+          xe::threading::MaybeYield();
         } else {
-          Sleep(wait / 0x100);
+          xe::threading::Sleep(
+              std::chrono::milliseconds::duration(wait / 0x100));
         }
-        MemoryBarrier();
+        xe::threading::SyncMemory();
         ReturnFromWait();
       } else {
-        SwitchToThread();
+        xe::threading::MaybeYield();
       }
     }
   } while (!matched);
@@ -1078,7 +1145,6 @@ bool CommandProcessor::ExecutePacketType3_REG_RMW(RingbufferReader* reader,
 }
 
 bool CommandProcessor::ExecutePacketType3_COND_WRITE(RingbufferReader* reader,
-
                                                      uint32_t packet,
                                                      uint32_t count) {
   // conditional write to memory or register
@@ -1093,8 +1159,8 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(RingbufferReader* reader,
     // Memory.
     auto endianness = static_cast<Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
-    trace_writer_.WriteMemoryRead(poll_reg_addr, 4);
-    value = poly::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
+    trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr), 4);
+    value = xe::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
   } else {
     // Register.
@@ -1135,8 +1201,8 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(RingbufferReader* reader,
       auto endianness = static_cast<Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      poly::store(memory_->TranslatePhysical(write_reg_addr), write_data);
-      trace_writer_.WriteMemoryWrite(write_reg_addr, 4);
+      xe::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1181,8 +1247,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(
   auto endianness = static_cast<Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  poly::store(memory_->TranslatePhysical(address), data_value);
-  trace_writer_.WriteMemoryWrite(address, 4);
+  xe::store(memory_->TranslatePhysical(address), data_value);
+  trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }
 
@@ -1205,10 +1271,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(
       1,          // max z
   };
   assert_true(endianness == xenos::Endian::k8in16);
-  poly::copy_and_swap_16_aligned(
+  xe::copy_and_swap_16_aligned(
       reinterpret_cast<uint16_t*>(memory_->TranslatePhysical(address)), extents,
-      poly::countof(extents));
-  trace_writer_.WriteMemoryWrite(address, sizeof(extents));
+      xe::countof(extents));
+  trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(extents));
   return true;
 }
 
@@ -1217,7 +1283,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(RingbufferReader* reader,
                                                     uint32_t count) {
   // initiate fetch of index buffer and draw
   // dword0 = viz query info
-  uint32_t dword0 = reader->Read();
+  /*uint32_t dword0 =*/reader->Read();
   uint32_t dword1 = reader->Read();
   uint32_t index_count = dword1 >> 16;
   auto prim_type = static_cast<PrimitiveType>(dword1 & 0x3F);
@@ -1263,7 +1329,6 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(RingbufferReader* reader,
 }
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(RingbufferReader* reader,
-
                                                       uint32_t packet,
                                                       uint32_t count) {
   // draw using supplied indices in packet
@@ -1272,9 +1337,10 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(RingbufferReader* reader,
   auto prim_type = static_cast<PrimitiveType>(dword0 & 0x3F);
   uint32_t src_sel = (dword0 >> 6) & 0x3;
   assert_true(src_sel == 0x2);  // 'SrcSel=AutoIndex'
-  bool index_32bit = (dword0 >> 11) & 0x1;
-  uint32_t indices_size = index_count * (index_32bit ? 4 : 2);
-  uint32_t index_ptr = reader->ptr();
+  // Index buffer unused as automatic.
+  // bool index_32bit = (dword0 >> 11) & 0x1;
+  // uint32_t indices_size = index_count * (index_32bit ? 4 : 2);
+  // uint32_t index_ptr = reader->ptr();
   index_buffer_info_.guest_base = 0;
   index_buffer_info_.length = 0;
   reader->Advance(count - 1);
@@ -1364,9 +1430,9 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(
       assert_always();
       return true;
   }
-  trace_writer_.WriteMemoryRead(address, size_dwords * 4);
+  trace_writer_.WriteMemoryRead(CpuToGpu(address), size_dwords * 4);
   for (uint32_t n = 0; n < size_dwords; n++, index++) {
-    uint32_t data = poly::load_and_swap<uint32_t>(
+    uint32_t data = xe::load_and_swap<uint32_t>(
         memory_->TranslatePhysical(address + n * 4));
     WriteRegister(index, data);
   }
@@ -1395,7 +1461,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(RingbufferReader* reader,
   uint32_t start = start_size >> 16;
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
-  trace_writer_.WriteMemoryRead(addr, size_dwords * 4);
+  trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
   LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr),
              size_dwords);
   return true;
@@ -1421,7 +1487,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(
 bool CommandProcessor::ExecutePacketType3_INVALIDATE_STATE(
     RingbufferReader* reader, uint32_t packet, uint32_t count) {
   // selective invalidation of state pointers
-  uint32_t mask = reader->Read();
+  /*uint32_t mask =*/reader->Read();
   // driver_->InvalidateState(mask);
   return true;
 }
@@ -1488,7 +1554,7 @@ bool CommandProcessor::IssueDraw() {
 #define CHECK_ISSUE_UPDATE_STATUS(status, mismatch, error_message) \
   {                                                                \
     if (status == UpdateStatus::kError) {                          \
-      PLOGE(error_message);                                        \
+      XELOGE(error_message);                                       \
       draw_batcher_.DiscardDraw();                                 \
       return false;                                                \
     } else if (status == UpdateStatus::kMismatch) {                \
@@ -1524,10 +1590,8 @@ bool CommandProcessor::IssueDraw() {
   if (!draw_batcher_.CommitDraw()) {
     return false;
   }
-  if (!has_bindless_vbos_) {
-    // TODO(benvanik): find a way to get around glVertexArrayVertexBuffer below.
-    draw_batcher_.Flush(DrawBatcher::FlushMode::kMakeCoherent);
-  }
+  // TODO(benvanik): find a way to get around glVertexArrayVertexBuffer below.
+  draw_batcher_.Flush(DrawBatcher::FlushMode::kMakeCoherent);
   return true;
 }
 
@@ -1584,7 +1648,8 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateShaders(
   xe_gpu_program_cntl_t program_cntl;
   program_cntl.dword_0 = regs.sq_program_cntl;
   if (!active_vertex_shader_->has_prepared()) {
-    if (!active_vertex_shader_->PrepareVertexShader(program_cntl)) {
+    if (!active_vertex_shader_->PrepareVertexShader(&shader_translator_,
+                                                    program_cntl)) {
       XELOGE("Unable to prepare vertex shader");
       return UpdateStatus::kError;
     }
@@ -1594,7 +1659,8 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateShaders(
   }
 
   if (!active_pixel_shader_->has_prepared()) {
-    if (!active_pixel_shader_->PreparePixelShader(program_cntl)) {
+    if (!active_pixel_shader_->PreparePixelShader(&shader_translator_,
+                                                  program_cntl)) {
       XELOGE("Unable to prepare pixel shader");
       return UpdateStatus::kError;
     }
@@ -1625,7 +1691,7 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateShaders(
   if (!cached_pipeline->handles.default_pipeline) {
     // Perhaps it's a bit wasteful to do all of these, but oh well.
     GLuint pipelines[5];
-    glCreateProgramPipelines(GLsizei(poly::countof(pipelines)), pipelines);
+    glCreateProgramPipelines(GLsizei(xe::countof(pipelines)), pipelines);
 
     glUseProgramStages(pipelines[0], GL_VERTEX_SHADER_BIT, vertex_program);
     glUseProgramStages(pipelines[0], GL_FRAGMENT_SHADER_BIT, fragment_program);
@@ -1656,15 +1722,8 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateShaders(
     cached_pipeline->handles.line_quad_list_pipeline = pipelines[4];
 
     // This can be set once, as the buffer never changes.
-    if (has_bindless_vbos_) {
-      glBindVertexArray(active_vertex_shader_->vao());
-      glBufferAddressRangeNV(GL_ELEMENT_ARRAY_ADDRESS_NV, 0,
-                             scratch_buffer_.gpu_handle(),
-                             scratch_buffer_.capacity());
-    } else {
-      glVertexArrayElementBuffer(active_vertex_shader_->vao(),
-                                 scratch_buffer_.handle());
-    }
+    glVertexArrayElementBuffer(active_vertex_shader_->vao(),
+                               scratch_buffer_.handle());
   }
 
   bool line_mode = false;
@@ -1675,8 +1734,12 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateShaders(
     }
   }
 
-  GLuint pipeline = cached_pipeline->handles.default_pipeline;
+  GLuint pipeline;
   switch (regs.prim_type) {
+    default:
+      // Default pipeline used.
+      pipeline = cached_pipeline->handles.default_pipeline;
+      break;
     case PrimitiveType::kPointList:
       pipeline = cached_pipeline->handles.point_list_pipeline;
       break;
@@ -1747,7 +1810,7 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateRenderTargets() {
         regs.rb_color3_info,
     };
     // A2XX_RB_COLOR_MASK_WRITE_* == D3DRS_COLORWRITEENABLE
-    for (int n = 0; n < poly::countof(color_info); n++) {
+    for (int n = 0; n < xe::countof(color_info); n++) {
       uint32_t write_mask = (regs.rb_color_mask >> (n * 4)) & 0xF;
       if (!write_mask || !shader_targets[n]) {
         // Unused, so keep disabled and set to wildcard so we'll take any
@@ -1801,14 +1864,12 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateRenderTargets() {
 }
 
 CommandProcessor::UpdateStatus CommandProcessor::UpdateState() {
-  auto& regs = *register_file_;
-
   bool mismatch = false;
 
 #define CHECK_UPDATE_STATUS(status, mismatch, error_message) \
   {                                                          \
     if (status == UpdateStatus::kError) {                    \
-      PLOGE(error_message);                                  \
+      XELOGE(error_message);                                 \
       return status;                                         \
     } else if (status == UpdateStatus::kMismatch) {          \
       mismatch = true;                                       \
@@ -1829,7 +1890,6 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateState() {
 }
 
 CommandProcessor::UpdateStatus CommandProcessor::UpdateViewportState() {
-  auto& reg_file = *register_file_;
   auto& regs = update_viewport_state_regs_;
 
   bool dirty = false;
@@ -1959,16 +2019,18 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateViewportState() {
     float texel_offset_y = 0.0f;
     float vox = vport_xoffset_enable ? regs.pa_cl_vport_xoffset : 0;
     float voy = vport_yoffset_enable ? regs.pa_cl_vport_yoffset : 0;
-    float voz = vport_zoffset_enable ? regs.pa_cl_vport_zoffset : 0;
     float vsx = vport_xscale_enable ? regs.pa_cl_vport_xscale : 1;
     float vsy = vport_yscale_enable ? regs.pa_cl_vport_yscale : 1;
-    float vsz = vport_zscale_enable ? regs.pa_cl_vport_zscale : 1;
     window_width_scalar = window_height_scalar = 1;
     float vpw = 2 * window_width_scalar * vsx;
     float vph = -2 * window_height_scalar * vsy;
     float vpx = window_width_scalar * vox - vpw / 2 + window_offset_x;
     float vpy = window_height_scalar * voy - vph / 2 + window_offset_y;
     glViewportIndexedf(0, vpx + texel_offset_x, vpy + texel_offset_y, vpw, vph);
+
+    // TODO(benvanik): depth range adjustment?
+    // float voz = vport_zoffset_enable ? regs.pa_cl_vport_zoffset : 0;
+    // float vsz = vport_zscale_enable ? regs.pa_cl_vport_zscale : 1;
   } else {
     float texel_offset_x = 0.0f;
     float texel_offset_y = 0.0f;
@@ -2132,7 +2194,7 @@ CommandProcessor::UpdateStatus CommandProcessor::UpdateBlendState() {
       /*  3 */ GL_MAX,
       /*  4 */ GL_FUNC_REVERSE_SUBTRACT,
   };
-  for (int i = 0; i < poly::countof(regs.rb_blendcontrol); ++i) {
+  for (int i = 0; i < xe::countof(regs.rb_blendcontrol); ++i) {
     uint32_t blend_control = regs.rb_blendcontrol[i];
     // A2XX_RB_BLEND_CONTROL_COLOR_SRCBLEND
     auto src_blend = blend_map[(blend_control & 0x0000001F) >> 0];
@@ -2298,11 +2360,11 @@ CommandProcessor::UpdateStatus CommandProcessor::PopulateIndexBuffer() {
     if (info.format == IndexFormat::kInt32) {
       auto dest = reinterpret_cast<uint32_t*>(allocation.host_ptr);
       auto src = memory_->TranslatePhysical<const uint32_t*>(info.guest_base);
-      poly::copy_and_swap_32_aligned(dest, src, info.count);
+      xe::copy_and_swap_32_aligned(dest, src, info.count);
     } else {
       auto dest = reinterpret_cast<uint16_t*>(allocation.host_ptr);
       auto src = memory_->TranslatePhysical<const uint16_t*>(info.guest_base);
-      poly::copy_and_swap_16_aligned(dest, src, info.count);
+      xe::copy_and_swap_16_aligned(dest, src, info.count);
     }
     draw_batcher_.set_index_buffer(allocation);
     scratch_buffer_.Commit(std::move(allocation));
@@ -2321,7 +2383,6 @@ CommandProcessor::UpdateStatus CommandProcessor::PopulateVertexBuffers() {
   auto& regs = *register_file_;
   assert_not_null(active_vertex_shader_);
 
-  uint32_t el_index = 0;
   const auto& buffer_inputs = active_vertex_shader_->buffer_inputs();
   for (uint32_t buffer_index = 0; buffer_index < buffer_inputs.count;
        ++buffer_index) {
@@ -2353,44 +2414,24 @@ CommandProcessor::UpdateStatus CommandProcessor::PopulateVertexBuffers() {
       // We could be smart about this to save GPU bandwidth by building a CRC
       // as we copy and only if it differs from the previous value committing
       // it (and if it matches just discard and reuse).
-      poly::copy_and_swap_32_aligned(
+      xe::copy_and_swap_32_aligned(
           reinterpret_cast<uint32_t*>(allocation.host_ptr),
           memory_->TranslatePhysical<const uint32_t*>(fetch->address << 2),
           valid_range / 4);
 
-      if (!has_bindless_vbos_) {
-        // TODO(benvanik): if we could find a way to avoid this, we could use
-        // multidraw without flushing.
-        glVertexArrayVertexBuffer(active_vertex_shader_->vao(), buffer_index,
-                                  scratch_buffer_.handle(), allocation.offset,
-                                  desc.stride_words * 4);
-      }
-
-      if (has_bindless_vbos_) {
-        for (uint32_t i = 0; i < desc.element_count; ++i, ++el_index) {
-          const auto& el = desc.elements[i];
-          draw_batcher_.set_vertex_buffer(el_index, 0, desc.stride_words * 4,
-                                          allocation);
-        }
-      }
+      // TODO(benvanik): if we could find a way to avoid this, we could use
+      // multidraw without flushing.
+      glVertexArrayVertexBuffer(active_vertex_shader_->vao(), buffer_index,
+                                scratch_buffer_.handle(), allocation.offset,
+                                desc.stride_words * 4);
 
       scratch_buffer_.Commit(std::move(allocation));
     } else {
-      if (!has_bindless_vbos_) {
-        // TODO(benvanik): if we could find a way to avoid this, we could use
-        // multidraw without flushing.
-        glVertexArrayVertexBuffer(active_vertex_shader_->vao(), buffer_index,
-                                  scratch_buffer_.handle(), allocation.offset,
-                                  desc.stride_words * 4);
-      }
-
-      if (has_bindless_vbos_) {
-        for (uint32_t i = 0; i < desc.element_count; ++i, ++el_index) {
-          const auto& el = desc.elements[i];
-          draw_batcher_.set_vertex_buffer(el_index, 0, desc.stride_words * 4,
-                                          allocation);
-        }
-      }
+      // TODO(benvanik): if we could find a way to avoid this, we could use
+      // multidraw without flushing.
+      glVertexArrayVertexBuffer(active_vertex_shader_->vao(), buffer_index,
+                                scratch_buffer_.handle(), allocation.offset,
+                                desc.stride_words * 4);
     }
   }
 
@@ -2401,8 +2442,6 @@ CommandProcessor::UpdateStatus CommandProcessor::PopulateSamplers() {
 #if FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // FINE_GRAINED_DRAW_SCOPES
-
-  auto& regs = *register_file_;
 
   bool mismatch = false;
 
@@ -2577,13 +2616,17 @@ bool CommandProcessor::IssueCopy() {
   if (!source_framebuffer) {
     // If we get here we are likely missing some state checks.
     assert_always("No framebuffer for copy source? no-op copy?");
-    PLOGE("No framebuffer for copy source");
+    XELOGE("No framebuffer for copy source");
     return false;
   }
 
   GLenum read_format;
   GLenum read_type;
   switch (copy_dest_format) {
+    case ColorFormat::k_1_5_5_5:
+      read_format = GL_RGB5_A1;
+      read_type = GL_UNSIGNED_SHORT_1_5_5_5_REV;
+      break;
     case ColorFormat::k_2_10_10_10:
       read_format = GL_RGB10_A2;
       read_type = GL_UNSIGNED_INT_10_10_10_2;
@@ -2600,6 +2643,10 @@ bool CommandProcessor::IssueCopy() {
       read_format = GL_R8;
       read_type = GL_UNSIGNED_BYTE;
       break;
+    case ColorFormat::k_8_8:
+      read_format = GL_RG8;
+      read_type = GL_UNSIGNED_BYTE;
+      break;
     case ColorFormat::k_8_8_8_8:
       read_format = copy_dest_swap ? GL_BGRA : GL_RGBA;
       read_type = GL_UNSIGNED_BYTE;
@@ -2609,15 +2656,23 @@ bool CommandProcessor::IssueCopy() {
       read_type = GL_UNSIGNED_SHORT;
       break;
     case ColorFormat::k_16_FLOAT:
-      read_format = GL_R16;
+      read_format = GL_R16F;
       read_type = GL_HALF_FLOAT;
       break;
     case ColorFormat::k_16_16:
       read_format = GL_RG16;
       read_type = GL_UNSIGNED_SHORT;
       break;
+    case ColorFormat::k_16_16_FLOAT:
+      read_format = GL_RG16F;
+      read_type = GL_HALF_FLOAT;
+      break;
+    case ColorFormat::k_16_16_16_16:
+      read_format = GL_RGBA16;
+      read_type = GL_UNSIGNED_SHORT;
+      break;
     case ColorFormat::k_16_16_16_16_FLOAT:
-      read_format = GL_RGBA;
+      read_format = GL_RGBA16F;
       read_type = GL_HALF_FLOAT;
       break;
     case ColorFormat::k_32_FLOAT:
@@ -2627,6 +2682,15 @@ bool CommandProcessor::IssueCopy() {
     case ColorFormat::k_32_32_FLOAT:
       read_format = GL_RG32F;
       read_type = GL_FLOAT;
+      break;
+    case ColorFormat::k_32_32_32_32_FLOAT:
+      read_format = GL_RGBA32F;
+      read_type = GL_FLOAT;
+      break;
+    case ColorFormat::k_10_11_11:
+    case ColorFormat::k_11_11_10:
+      read_format = GL_R11F_G11F_B10F;
+      read_type = GL_UNSIGNED_INT_10F_11F_11F_REV;
       break;
     default:
       assert_unhandled_case(copy_dest_format);
@@ -2662,8 +2726,8 @@ bool CommandProcessor::IssueCopy() {
   // but I can't seem to find something similar.
   uint32_t dest_logical_width = copy_dest_pitch;
   uint32_t dest_logical_height = copy_dest_height;
-  uint32_t dest_block_width = poly::round_up(dest_logical_width, 32);
-  uint32_t dest_block_height = poly::round_up(dest_logical_height, 32);
+  uint32_t dest_block_width = xe::round_up(dest_logical_width, 32);
+  uint32_t dest_block_height = xe::round_up(dest_logical_height, 32);
 
   uint32_t window_offset = regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET].u32;
   int16_t window_offset_x = window_offset & 0x7FFF;
@@ -2699,24 +2763,24 @@ bool CommandProcessor::IssueCopy() {
   trace_writer_.WriteMemoryRead(fetch->address << 2, fetch->size * 4);
   int32_t dest_min_x = int32_t((std::min(
       std::min(
-          GpuSwap(poly::load<float>(vertex_addr + 0), Endian(fetch->endian)),
-          GpuSwap(poly::load<float>(vertex_addr + 8), Endian(fetch->endian))),
-      GpuSwap(poly::load<float>(vertex_addr + 16), Endian(fetch->endian)))));
+          GpuSwap(xe::load<float>(vertex_addr + 0), Endian(fetch->endian)),
+          GpuSwap(xe::load<float>(vertex_addr + 8), Endian(fetch->endian))),
+      GpuSwap(xe::load<float>(vertex_addr + 16), Endian(fetch->endian)))));
   int32_t dest_max_x = int32_t((std::max(
       std::max(
-          GpuSwap(poly::load<float>(vertex_addr + 0), Endian(fetch->endian)),
-          GpuSwap(poly::load<float>(vertex_addr + 8), Endian(fetch->endian))),
-      GpuSwap(poly::load<float>(vertex_addr + 16), Endian(fetch->endian)))));
+          GpuSwap(xe::load<float>(vertex_addr + 0), Endian(fetch->endian)),
+          GpuSwap(xe::load<float>(vertex_addr + 8), Endian(fetch->endian))),
+      GpuSwap(xe::load<float>(vertex_addr + 16), Endian(fetch->endian)))));
   int32_t dest_min_y = int32_t((std::min(
       std::min(
-          GpuSwap(poly::load<float>(vertex_addr + 4), Endian(fetch->endian)),
-          GpuSwap(poly::load<float>(vertex_addr + 12), Endian(fetch->endian))),
-      GpuSwap(poly::load<float>(vertex_addr + 20), Endian(fetch->endian)))));
+          GpuSwap(xe::load<float>(vertex_addr + 4), Endian(fetch->endian)),
+          GpuSwap(xe::load<float>(vertex_addr + 12), Endian(fetch->endian))),
+      GpuSwap(xe::load<float>(vertex_addr + 20), Endian(fetch->endian)))));
   int32_t dest_max_y = int32_t((std::max(
       std::max(
-          GpuSwap(poly::load<float>(vertex_addr + 4), Endian(fetch->endian)),
-          GpuSwap(poly::load<float>(vertex_addr + 12), Endian(fetch->endian))),
-      GpuSwap(poly::load<float>(vertex_addr + 20), Endian(fetch->endian)))));
+          GpuSwap(xe::load<float>(vertex_addr + 4), Endian(fetch->endian)),
+          GpuSwap(xe::load<float>(vertex_addr + 12), Endian(fetch->endian))),
+      GpuSwap(xe::load<float>(vertex_addr + 20), Endian(fetch->endian)))));
   Rect2D dest_rect(dest_min_x, dest_min_y, dest_max_x - dest_min_x,
                    dest_max_y - dest_min_y);
   Rect2D src_rect(0, 0, dest_rect.width, dest_rect.height);
@@ -2732,7 +2796,9 @@ bool CommandProcessor::IssueCopy() {
   // Destination pointer in guest memory.
   // We have GL throw bytes directly into it.
   // TODO(benvanik): copy to staging texture then PBO back?
-  void* ptr = memory_->TranslatePhysical(copy_dest_base);
+  // void* ptr = memory_->TranslatePhysical(copy_dest_base);
+
+  auto blitter = static_cast<xe::ui::gl::GLContext*>(context_.get())->blitter();
 
   // Make active so glReadPixels reads from us.
   switch (copy_command) {
@@ -2743,8 +2809,8 @@ bool CommandProcessor::IssueCopy() {
         // Source from a bound render target.
         // TODO(benvanik): RAW copy.
         last_framebuffer_texture_ = texture_cache_.CopyTexture(
-            context_->blitter(), copy_dest_base, dest_logical_width,
-            dest_logical_height, dest_block_width, dest_block_height,
+            blitter, copy_dest_base, dest_logical_width, dest_logical_height,
+            dest_block_width, dest_block_height,
             ColorFormatToTextureFormat(copy_dest_format),
             copy_dest_swap ? true : false, color_targets[copy_src_select],
             src_rect, dest_rect);
@@ -2754,11 +2820,10 @@ bool CommandProcessor::IssueCopy() {
       } else {
         // Source from the bound depth/stencil target.
         // TODO(benvanik): RAW copy.
-        texture_cache_.CopyTexture(context_->blitter(), copy_dest_base,
-                                   dest_logical_width, dest_logical_height,
-                                   dest_block_width, dest_block_height,
-                                   src_format, copy_dest_swap ? true : false,
-                                   depth_target, src_rect, dest_rect);
+        texture_cache_.CopyTexture(
+            blitter, copy_dest_base, dest_logical_width, dest_logical_height,
+            dest_block_width, dest_block_height, src_format,
+            copy_dest_swap ? true : false, depth_target, src_rect, dest_rect);
         if (!FLAGS_disable_framebuffer_readback) {
           // glReadPixels(x, y, w, h, GL_DEPTH_STENCIL, read_type, ptr);
         }
@@ -2771,8 +2836,8 @@ bool CommandProcessor::IssueCopy() {
         // Either copy the readbuffer into an existing texture or create a new
         // one in the cache so we can service future upload requests.
         last_framebuffer_texture_ = texture_cache_.ConvertTexture(
-            context_->blitter(), copy_dest_base, dest_logical_width,
-            dest_logical_height, dest_block_width, dest_block_height,
+            blitter, copy_dest_base, dest_logical_width, dest_logical_height,
+            dest_block_width, dest_block_height,
             ColorFormatToTextureFormat(copy_dest_format),
             copy_dest_swap ? true : false, color_targets[copy_src_select],
             src_rect, dest_rect);
@@ -2781,11 +2846,10 @@ bool CommandProcessor::IssueCopy() {
         }
       } else {
         // Source from the bound depth/stencil target.
-        texture_cache_.ConvertTexture(context_->blitter(), copy_dest_base,
-                                      dest_logical_width, dest_logical_height,
-                                      dest_block_width, dest_block_height,
-                                      src_format, copy_dest_swap ? true : false,
-                                      depth_target, src_rect, dest_rect);
+        texture_cache_.ConvertTexture(
+            blitter, copy_dest_base, dest_logical_width, dest_logical_height,
+            dest_block_width, dest_block_height, src_format,
+            copy_dest_swap ? true : false, depth_target, src_rect, dest_rect);
         if (!FLAGS_disable_framebuffer_readback) {
           // glReadPixels(x, y, w, h, GL_DEPTH_STENCIL, read_type, ptr);
         }
@@ -2824,29 +2888,25 @@ bool CommandProcessor::IssueCopy() {
   }
 
   // TODO(benvanik): figure out real condition here (maybe when color cleared?)
-  // HACK: things seem to need their depth buffer cleared a lot more
-  // than as indicated by the depth_clear_enabled flag.
-  // if (depth_clear_enabled) {
-  if (depth_target != kAnyTarget) {
+  if (depth_clear_enabled && depth_target != kAnyTarget) {
     // Clear the current depth buffer.
     // TODO(benvanik): verify format.
     GLfloat depth = {(copy_depth_clear & 0xFFFFFF00) / float(0xFFFFFF00)};
     GLint stencil = copy_depth_clear & 0xFF;
-    GLint old_draw_framebuffer;
     GLboolean old_depth_mask;
     GLint old_stencil_mask;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &old_draw_framebuffer);
     glGetBooleanv(GL_DEPTH_WRITEMASK, &old_depth_mask);
     glGetIntegerv(GL_STENCIL_WRITEMASK, &old_stencil_mask);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, source_framebuffer->framebuffer);
     glDepthMask(GL_TRUE);
     glStencilMask(0xFF);
     // HACK: this should work, but throws INVALID_ENUM on nvidia drivers.
     /* glClearNamedFramebufferfi(source_framebuffer->framebuffer,
                              GL_DEPTH_STENCIL,
                              depth, stencil);*/
-    glClearBufferfi(GL_DEPTH_STENCIL, 0, depth, stencil);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, old_draw_framebuffer);
+    glClearNamedFramebufferfv(source_framebuffer->framebuffer, GL_DEPTH, 0,
+                              &depth);
+    glClearNamedFramebufferiv(source_framebuffer->framebuffer, GL_STENCIL, 0,
+                              &stencil);
     glDepthMask(old_depth_mask);
     glStencilMask(old_stencil_mask);
   }
@@ -2868,7 +2928,7 @@ GLuint CommandProcessor::GetColorRenderTarget(uint32_t pitch,
     format = ColorRenderTargetFormat::k_8_8_8_8;
   }
 
-  for (auto& it = cached_color_render_targets_.begin();
+  for (auto it = cached_color_render_targets_.begin();
        it != cached_color_render_targets_.end(); ++it) {
     if (it->base == base && it->width == width && it->height == height &&
         it->format == format) {
@@ -2932,7 +2992,7 @@ GLuint CommandProcessor::GetDepthRenderTarget(uint32_t pitch,
   uint32_t width = 2560;
   uint32_t height = 2560;
 
-  for (auto& it = cached_depth_render_targets_.begin();
+  for (auto it = cached_depth_render_targets_.begin();
        it != cached_depth_render_targets_.end(); ++it) {
     if (it->base == base && it->width == width && it->height == height &&
         it->format == format) {
@@ -2968,8 +3028,8 @@ GLuint CommandProcessor::GetDepthRenderTarget(uint32_t pitch,
 
 CommandProcessor::CachedFramebuffer* CommandProcessor::GetFramebuffer(
     GLuint color_targets[4], GLuint depth_target) {
-  for (auto& it = cached_framebuffers_.begin();
-       it != cached_framebuffers_.end(); ++it) {
+  for (auto it = cached_framebuffers_.begin(); it != cached_framebuffers_.end();
+       ++it) {
     if ((depth_target == kAnyTarget || it->depth_target == depth_target) &&
         (color_targets[0] == kAnyTarget ||
          it->color_targets[0] == color_targets[0]) &&

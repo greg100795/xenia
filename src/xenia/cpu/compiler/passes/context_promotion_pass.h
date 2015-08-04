@@ -10,6 +10,7 @@
 #ifndef XENIA_COMPILER_PASSES_CONTEXT_PROMOTION_PASS_H_
 #define XENIA_COMPILER_PASSES_CONTEXT_PROMOTION_PASS_H_
 
+#include "xenia/base/platform.h"
 #include "xenia/cpu/compiler/compiler_pass.h"
 
 #if XE_COMPILER_MSVC
@@ -33,9 +34,9 @@ class ContextPromotionPass : public CompilerPass {
   ContextPromotionPass();
   virtual ~ContextPromotionPass() override;
 
-  int Initialize(Compiler* compiler) override;
+  bool Initialize(Compiler* compiler) override;
 
-  int Run(hir::HIRBuilder* builder) override;
+  bool Run(hir::HIRBuilder* builder) override;
 
  private:
   void PromoteBlock(hir::Block* block);

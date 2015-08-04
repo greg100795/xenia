@@ -9,7 +9,7 @@
 
 #include "xenia/cpu/entry_table.h"
 
-#include "poly/poly.h"
+#include "xenia/base/threading.h"
 #include "xenia/profiling.h"
 
 namespace xe {
@@ -18,7 +18,7 @@ namespace cpu {
 EntryTable::EntryTable() = default;
 
 EntryTable::~EntryTable() {
-  std::lock_guard<std::mutex> guard(lock_);
+  std::lock_guard<xe::mutex> guard(lock_);
   for (auto it : map_) {
     Entry* entry = it.second;
     delete entry;
@@ -26,7 +26,7 @@ EntryTable::~EntryTable() {
 }
 
 Entry* EntryTable::Get(uint32_t address) {
-  std::lock_guard<std::mutex> guard(lock_);
+  std::lock_guard<xe::mutex> guard(lock_);
   const auto& it = map_.find(address);
   Entry* entry = it != map_.end() ? it->second : nullptr;
   if (entry) {
@@ -53,7 +53,7 @@ Entry::Status EntryTable::GetOrCreate(uint32_t address, Entry** out_entry) {
       do {
         lock_.unlock();
         // TODO(benvanik): sleep for less time?
-        poly::threading::Sleep(std::chrono::microseconds(10));
+        xe::threading::Sleep(std::chrono::microseconds(10));
         lock_.lock();
       } while (entry->status == Entry::STATUS_COMPILING);
     }
@@ -74,7 +74,7 @@ Entry::Status EntryTable::GetOrCreate(uint32_t address, Entry** out_entry) {
 }
 
 std::vector<Function*> EntryTable::FindWithAddress(uint32_t address) {
-  std::lock_guard<std::mutex> guard(lock_);
+  std::lock_guard<xe::mutex> guard(lock_);
   std::vector<Function*> fns;
   for (auto& it : map_) {
     Entry* entry = it.second;

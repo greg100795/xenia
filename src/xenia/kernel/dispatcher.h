@@ -12,7 +12,7 @@
 
 #include <mutex>
 
-#include "xenia/common.h"
+#include "xenia/base/mutex.h"
 #include "xenia/xbox.h"
 
 namespace xe {
@@ -37,7 +37,7 @@ class Dispatcher {
  private:
   KernelState* kernel_state_;
 
-  std::mutex lock_;
+  xe::mutex lock_;
   NativeList* dpc_list_;
 };
 

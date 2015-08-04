@@ -7,8 +7,7 @@
  ******************************************************************************
  */
 
-#include "xenia/common.h"
-#include "xenia/cpu/cpu.h"
+#include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/gpu/xenos.h"
@@ -20,8 +19,6 @@
 
 namespace xe {
 namespace kernel {
-
-using xe::gpu::GraphicsSystem;
 
 // http://www.tweakoz.com/orkid/
 // http://www.tweakoz.com/orkid/dox/d3/d52/xb360init_8cpp_source.html
@@ -36,417 +33,351 @@ using xe::gpu::GraphicsSystem;
 // http://www.microsoft.com/en-za/download/details.aspx?id=5313 -- "Stripped
 // Down Direct3D: Xbox 360 Command Buffer and Resource Management"
 
-SHIM_CALL VdGetCurrentDisplayGamma_shim(PPCContext* ppc_state,
-                                        KernelState* state) {
-  uint32_t arg0_ptr = SHIM_GET_ARG_32(0);
-  uint32_t arg1_ptr = SHIM_GET_ARG_32(1);
-
-  XELOGD("VdGetCurrentDisplayGamma(%.8X, %.8X)", arg0_ptr, arg1_ptr);
-
-  SHIM_SET_MEM_32(arg0_ptr, 2);
-  SHIM_SET_MEM_F32(arg1_ptr, 2.22222233f);
+void VdGetCurrentDisplayGamma(lpdword_t arg0_ptr, lpfloat_t arg1_ptr) {
+  *arg0_ptr = 2;
+  *arg1_ptr = 2.22222233f;
 }
+DECLARE_XBOXKRNL_EXPORT(VdGetCurrentDisplayGamma, ExportTag::kVideo);
 
-SHIM_CALL VdGetCurrentDisplayInformation_shim(PPCContext* ppc_state,
-                                              KernelState* state) {
-  uint32_t ptr = SHIM_GET_ARG_32(0);
+struct X_D3DPRIVATE_RECT {
+  xe::be<uint32_t> x1;  // 0x0
+  xe::be<uint32_t> y1;  // 0x4
+  xe::be<uint32_t> x2;  // 0x8
+  xe::be<uint32_t> y2;  // 0xC
+};
+static_assert_size(X_D3DPRIVATE_RECT, 0x10);
 
-  XELOGD("VdGetCurrentDisplayInformation(%.8X)", ptr);
+struct X_D3DFILTER_PARAMETERS {
+  xe::be<float> nyquist;         // 0x0
+  xe::be<float> flicker_filter;  // 0x4
+  xe::be<float> beta;            // 0x8
+};
+static_assert_size(X_D3DFILTER_PARAMETERS, 0xC);
 
-  // Expecting a length 0x58 struct of stuff.
-  SHIM_SET_MEM_32(ptr + 0, (1280 << 16) | 720);
-  SHIM_SET_MEM_32(ptr + 4, 0);
-  SHIM_SET_MEM_32(ptr + 8, 0);
-  SHIM_SET_MEM_32(ptr + 12, 0);
-  SHIM_SET_MEM_32(ptr + 16, 1280);  // backbuffer width?
-  SHIM_SET_MEM_32(ptr + 20, 720);   // backbuffer height?
-  SHIM_SET_MEM_32(ptr + 24, 1280);
-  SHIM_SET_MEM_32(ptr + 28, 720);
-  SHIM_SET_MEM_32(ptr + 32, 1);
-  SHIM_SET_MEM_32(ptr + 36, 0);
-  SHIM_SET_MEM_32(ptr + 40, 0);
-  SHIM_SET_MEM_32(ptr + 44, 0);
-  SHIM_SET_MEM_32(ptr + 48, 1);
-  SHIM_SET_MEM_32(ptr + 52, 0);
-  SHIM_SET_MEM_32(ptr + 56, 0);
-  SHIM_SET_MEM_32(ptr + 60, 0);
-  SHIM_SET_MEM_32(ptr + 64, 0x014000B4);          // ?
-  SHIM_SET_MEM_32(ptr + 68, 0x014000B4);          // ?
-  SHIM_SET_MEM_32(ptr + 72, (1280 << 16) | 720);  // actual display size?
-  SHIM_SET_MEM_32(ptr + 76, 0x42700000);
-  SHIM_SET_MEM_32(ptr + 80, 0);
-  SHIM_SET_MEM_32(ptr + 84, 1280);  // display width
+struct X_D3DPRIVATE_SCALER_PARAMETERS {
+  X_D3DPRIVATE_RECT scaler_source_rect;                 // 0x0
+  xe::be<uint32_t> scaled_output_width;                 // 0x10
+  xe::be<uint32_t> scaled_output_height;                // 0x14
+  xe::be<uint32_t> vertical_filter_type;                // 0x18
+  X_D3DFILTER_PARAMETERS vertical_filter_parameters;    // 0x1C
+  xe::be<uint32_t> horizontal_filter_type;              // 0x28
+  X_D3DFILTER_PARAMETERS horizontal_filter_parameters;  // 0x2C
+};
+static_assert_size(X_D3DPRIVATE_SCALER_PARAMETERS, 0x38);
+
+struct X_DISPLAY_INFO {
+  xe::be<uint16_t> front_buffer_width;               // 0x0
+  xe::be<uint16_t> front_buffer_height;              // 0x2
+  xe::be<uint8_t> front_buffer_color_format;         // 0x4
+  xe::be<uint8_t> front_buffer_pixel_format;         // 0x5
+  X_D3DPRIVATE_SCALER_PARAMETERS scaler_parameters;  // 0x6
+  xe::be<uint16_t> display_window_overscan_left;     // 0x40
+  xe::be<uint16_t> display_window_overscan_top;      // 0x42
+  xe::be<uint16_t> display_window_overscan_right;    // 0x44
+  xe::be<uint16_t> display_window_overscan_bottom;   // 0x46
+  xe::be<uint16_t> display_width;                    // 0x48
+  xe::be<uint16_t> display_height;                   // 0x4A
+  xe::be<float> display_refresh_rate;                // 0x4C
+  xe::be<uint32_t> display_interlaced;               // 0x50
+  xe::be<uint8_t> display_color_format;              // 0x54
+  xe::be<uint16_t> actual_display_width;             // 0x56
+};
+static_assert_size(X_DISPLAY_INFO, 0x58);
+
+void VdQueryVideoMode(pointer_t<X_VIDEO_MODE> video_mode);
+
+void VdGetCurrentDisplayInformation(pointer_t<X_DISPLAY_INFO> display_info) {
+  X_VIDEO_MODE mode;
+  VdQueryVideoMode(&mode);
+
+  display_info.Zero();
+  display_info->front_buffer_width = (uint16_t)mode.display_width;
+  display_info->front_buffer_height = (uint16_t)mode.display_height;
+
+  display_info->scaler_parameters.scaler_source_rect.x2 = mode.display_width;
+  display_info->scaler_parameters.scaler_source_rect.y2 = mode.display_height;
+  display_info->scaler_parameters.scaled_output_width = mode.display_width;
+  display_info->scaler_parameters.scaled_output_height = mode.display_height;
+  display_info->scaler_parameters.horizontal_filter_type = 1;
+  display_info->scaler_parameters.vertical_filter_type = 1;
+
+  display_info->display_window_overscan_left = 320;
+  display_info->display_window_overscan_top = 180;
+  display_info->display_window_overscan_right = 320;
+  display_info->display_window_overscan_bottom = 180;
+  display_info->display_width = (uint16_t)mode.display_width;
+  display_info->display_height = (uint16_t)mode.display_height;
+  display_info->display_refresh_rate = mode.refresh_rate;
+  display_info->actual_display_width = (uint16_t)mode.display_width;
 }
+DECLARE_XBOXKRNL_EXPORT(VdGetCurrentDisplayInformation, ExportTag::kVideo);
 
-SHIM_CALL VdQueryVideoFlags_shim(PPCContext* ppc_state, KernelState* state) {
-  XELOGD("VdQueryVideoFlags()");
-
-  SHIM_SET_RETURN_64(0x00000006);
-}
-
-void xeVdQueryVideoMode(X_VIDEO_MODE* video_mode) {
-  if (video_mode == NULL) {
-    return;
-  }
-
+void VdQueryVideoMode(pointer_t<X_VIDEO_MODE> video_mode) {
   // TODO: get info from actual display
+  video_mode.Zero();
   video_mode->display_width = 1280;
   video_mode->display_height = 720;
   video_mode->is_interlaced = 0;
   video_mode->is_widescreen = 1;
   video_mode->is_hi_def = 1;
   video_mode->refresh_rate = 60.0f;
-  video_mode->video_standard = 1;   // NTSC
-  video_mode->unknown_0x8a = 0x94;  // 0x8A;
+  video_mode->video_standard = 1;  // NTSC
+  video_mode->unknown_0x8a = 0x4A;
   video_mode->unknown_0x01 = 0x01;
-  video_mode->reserved[0] = video_mode->reserved[1] = video_mode->reserved[2] =
-      0;
 }
+DECLARE_XBOXKRNL_EXPORT(VdQueryVideoMode, ExportTag::kVideo);
 
-SHIM_CALL VdQueryVideoMode_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t video_mode_ptr = SHIM_GET_ARG_32(0);
-  X_VIDEO_MODE* video_mode = (X_VIDEO_MODE*)SHIM_MEM_ADDR(video_mode_ptr);
+dword_result_t VdQueryVideoFlags() {
+  X_VIDEO_MODE mode;
+  VdQueryVideoMode(&mode);
 
-  XELOGD("VdQueryVideoMode(%.8X)", video_mode_ptr);
+  uint32_t flags = 0;
+  flags |= mode.is_widescreen ? 1 : 0;
+  flags |= mode.display_width >= 1024 ? 2 : 0;
+  flags |= mode.display_width >= 1920 ? 4 : 0;
 
-  xeVdQueryVideoMode(video_mode);
+  return flags;
 }
+DECLARE_XBOXKRNL_EXPORT(VdQueryVideoFlags, ExportTag::kVideo);
 
-SHIM_CALL VdSetDisplayMode_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t mode = SHIM_GET_ARG_32(0);
-
-  // 40000000
-  XELOGD("VdSetDisplayMode(%.8X)", mode);
-
-  SHIM_SET_RETURN_64(0);
+dword_result_t VdSetDisplayMode(dword_t mode) {
+  // Often 0x40000000.
+  return 0;
 }
+DECLARE_XBOXKRNL_EXPORT(VdSetDisplayMode, ExportTag::kVideo | ExportTag::kStub);
 
-SHIM_CALL VdSetDisplayModeOverride_shim(PPCContext* ppc_state,
-                                        KernelState* state) {
-  uint32_t unk0 = SHIM_GET_ARG_32(0);
-  uint32_t unk1 = SHIM_GET_ARG_32(1);
-  double refresh_rate = ppc_state->f[1];  // 0, 50, 59.9, etc.
-  uint32_t unk3 = SHIM_GET_ARG_32(2);
-  uint32_t unk4 = SHIM_GET_ARG_32(3);
-
-  // TODO(benvanik): something with refresh rate?
-  XELOGD("VdSetDisplayModeOverride(%.8X, %.8X, %g, %.8X, %.8X)", unk0, unk1,
-         refresh_rate, unk3, unk4);
-
-  SHIM_SET_RETURN_64(0);
+dword_result_t VdSetDisplayModeOverride(unknown_t unk0, unknown_t unk1,
+                                        double_t refresh_rate, unknown_t unk3,
+                                        unknown_t unk4) {
+  // refresh_rate = 0, 50, 59.9, etc.
+  return 0;
 }
+DECLARE_XBOXKRNL_EXPORT(VdSetDisplayModeOverride,
+                        ExportTag::kVideo | ExportTag::kStub);
 
-SHIM_CALL VdInitializeEngines_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t unk0 = SHIM_GET_ARG_32(0);
-  uint32_t callback = SHIM_GET_ARG_32(1);
-  uint32_t unk1 = SHIM_GET_ARG_32(2);
-  uint32_t unk2_ptr = SHIM_GET_ARG_32(3);
-  uint32_t unk3_ptr = SHIM_GET_ARG_32(4);
-
-  XELOGD("VdInitializeEngines(%.8X, %.8X, %.8X, %.8X, %.8X)", unk0, callback,
-         unk1, unk2_ptr, unk3_ptr);
-
+dword_result_t VdInitializeEngines(unknown_t unk0, function_t callback,
+                                   unknown_t unk1, lpunknown_t unk2_ptr,
+                                   lpunknown_t unk3_ptr) {
   // r3 = 0x4F810000
   // r4 = function ptr (cleanup callback?)
   // r5 = 0
   // r6/r7 = some binary data in .data
+  return 1;
 }
+DECLARE_XBOXKRNL_EXPORT(VdInitializeEngines,
+                        ExportTag::kVideo | ExportTag::kStub);
 
-SHIM_CALL VdShutdownEngines_shim(PPCContext* ppc_state, KernelState* state) {
-  XELOGD("VdShutdownEngines()");
-
+void VdShutdownEngines() {
   // Ignored for now.
   // Games seem to call an Initialize/Shutdown pair to query info, then
   // re-initialize.
 }
+DECLARE_XBOXKRNL_EXPORT(VdShutdownEngines,
+                        ExportTag::kVideo | ExportTag::kStub);
 
-SHIM_CALL VdGetGraphicsAsicID_shim(PPCContext* ppc_state, KernelState* state) {
-  XELOGD("VdGetGraphicsAsicID()");
-
+dword_result_t VdGetGraphicsAsicID() {
   // Games compare for < 0x10 and do VdInitializeEDRAM, else other
   // (retrain/etc).
-  SHIM_SET_RETURN_64(0x11);
+  return 0x11;
 }
+DECLARE_XBOXKRNL_EXPORT(VdGetGraphicsAsicID, ExportTag::kVideo);
 
-SHIM_CALL VdEnableDisableClockGating_shim(PPCContext* ppc_state,
-                                          KernelState* state) {
-  uint32_t enabled = SHIM_GET_ARG_32(0);
-
-  XELOGD("VdEnableDisableClockGating(%d)", enabled);
-
+dword_result_t VdEnableDisableClockGating(dword_t enabled) {
   // Ignored, as it really doesn't matter.
-
-  SHIM_SET_RETURN_64(0);
+  return 0;
 }
+DECLARE_XBOXKRNL_EXPORT(VdEnableDisableClockGating, ExportTag::kVideo);
 
-SHIM_CALL VdSetGraphicsInterruptCallback_shim(PPCContext* ppc_state,
-                                              KernelState* state) {
-  uint32_t callback = SHIM_GET_ARG_32(0);
-  uint32_t user_data = SHIM_GET_ARG_32(1);
-
-  XELOGD("VdSetGraphicsInterruptCallback(%.8X, %.8X)", callback, user_data);
-
-  GraphicsSystem* gs = state->emulator()->graphics_system();
-  if (!gs) {
-    return;
-  }
-
+void VdSetGraphicsInterruptCallback(function_t callback, lpvoid_t user_data) {
   // callback takes 2 params
   // r3 = bool 0/1 - 0 is normal interrupt, 1 is some acquire/lock mumble
   // r4 = user_data (r4 of VdSetGraphicsInterruptCallback)
-
-  gs->SetInterruptCallback(callback, user_data);
+  auto graphics_system = kernel_state()->emulator()->graphics_system();
+  graphics_system->SetInterruptCallback(callback, user_data);
 }
+DECLARE_XBOXKRNL_EXPORT(VdSetGraphicsInterruptCallback, ExportTag::kVideo);
 
-SHIM_CALL VdInitializeRingBuffer_shim(PPCContext* ppc_state,
-                                      KernelState* state) {
-  uint32_t ptr = SHIM_GET_ARG_32(0);
-  uint32_t page_count = SHIM_GET_ARG_32(1);
-
-  XELOGD("VdInitializeRingBuffer(%.8X, %.8X)", ptr, page_count);
-
-  GraphicsSystem* gs = state->emulator()->graphics_system();
-  if (!gs) {
-    return;
-  }
-
+void VdInitializeRingBuffer(lpvoid_t ptr, int_t page_count) {
   // r3 = result of MmGetPhysicalAddress
   // r4 = number of pages? page size?
   //      0x8000 -> cntlzw=16 -> 0x1C - 16 = 12
   // Buffer pointers are from MmAllocatePhysicalMemory with WRITE_COMBINE.
   // Sizes could be zero? XBLA games seem to do this. Default sizes?
   // D3D does size / region_count - must be > 1024
-
-  gs->InitializeRingBuffer(ptr, page_count);
+  auto graphics_system = kernel_state()->emulator()->graphics_system();
+  graphics_system->InitializeRingBuffer(ptr, page_count);
 }
+DECLARE_XBOXKRNL_EXPORT(VdInitializeRingBuffer, ExportTag::kVideo);
 
-SHIM_CALL VdEnableRingBufferRPtrWriteBack_shim(PPCContext* ppc_state,
-                                               KernelState* state) {
-  uint32_t ptr = SHIM_GET_ARG_32(0);
-  uint32_t block_size = SHIM_GET_ARG_32(1);
-
-  XELOGD("VdEnableRingBufferRPtrWriteBack(%.8X, %.8X)", ptr, block_size);
-
-  GraphicsSystem* gs = state->emulator()->graphics_system();
-  if (!gs) {
-    return;
-  }
-
+void VdEnableRingBufferRPtrWriteBack(lpvoid_t ptr, int_t block_size) {
   // r4 = 6, usually --- <=19
-  gs->EnableReadPointerWriteBack(ptr, block_size);
-
-  ptr += 0x20000000;
-  // printf("%.8X", ptr);
-  // 0x0110343c
-
-  // r3 = 0x2B10(d3d?) + 0x3C
-
-  //((p + 0x3C) & 0x1FFFFFFF) + ((((p + 0x3C) >> 20) + 0x200) & 0x1000)
-  // also 0x3C offset into WriteBacks is PrimaryRingBufferReadIndex
-  //(1:17:38 AM) Rick: .text:8201B348                 lwz       r11, 0x2B10(r31)
-  //(1:17:38 AM) Rick: .text:8201B34C                 addi      r11, r11, 0x3C
-  //(1:17:38 AM) Rick: .text:8201B350                 srwi      r10, r11, 20  #
-  // r10 = r11 >> 20
-  //(1:17:38 AM) Rick: .text:8201B354                 clrlwi    r11, r11, 3   #
-  // r11 = r11 & 0x1FFFFFFF
-  //(1:17:38 AM) Rick: .text:8201B358                 addi      r10, r10, 0x200
-  //(1:17:39 AM) Rick: .text:8201B35C                 rlwinm    r10, r10,
-  // 0,19,19 # r10 = r10 & 0x1000
-  //(1:17:39 AM) Rick: .text:8201B360                 add       r3, r10, r11
-  //(1:17:39 AM) Rick: .text:8201B364                 bl
-  // VdEnableRingBufferRPtrWriteBack
-  // TODO(benvanik): something?
+  auto graphics_system = kernel_state()->emulator()->graphics_system();
+  graphics_system->EnableReadPointerWriteBack(ptr, block_size);
 }
+DECLARE_XBOXKRNL_EXPORT(VdEnableRingBufferRPtrWriteBack, ExportTag::kVideo);
 
-SHIM_CALL VdGetSystemCommandBuffer_shim(PPCContext* ppc_state,
-                                        KernelState* state) {
-  uint32_t p0_ptr = SHIM_GET_ARG_32(0);
-  uint32_t p1_ptr = SHIM_GET_ARG_32(1);
-
-  XELOGD("VdGetSystemCommandBuffer(%.8X, %.8X)", p0_ptr, p1_ptr);
-
-  SHIM_SET_MEM_32(p0_ptr, 0xBEEF0000);
-  SHIM_SET_MEM_32(p1_ptr, 0xBEEF0001);
+void VdGetSystemCommandBuffer(lpunknown_t p0_ptr, lpunknown_t p1_ptr) {
+  p0_ptr.Zero(0x94);
+  xe::store_and_swap<uint32_t>(p0_ptr, 0xBEEF0000);
+  xe::store_and_swap<uint32_t>(p1_ptr, 0xBEEF0001);
 }
+DECLARE_XBOXKRNL_EXPORT(VdGetSystemCommandBuffer,
+                        ExportTag::kVideo | ExportTag::kStub);
 
-SHIM_CALL VdSetSystemCommandBufferGpuIdentifierAddress_shim(
-    PPCContext* ppc_state, KernelState* state) {
-  uint32_t unk = SHIM_GET_ARG_32(0);
-
-  XELOGD("VdSetSystemCommandBufferGpuIdentifierAddress(%.8X)", unk);
-
+void VdSetSystemCommandBufferGpuIdentifierAddress(lpunknown_t unk) {
   // r3 = 0x2B10(d3d?) + 8
 }
+DECLARE_XBOXKRNL_EXPORT(VdSetSystemCommandBufferGpuIdentifierAddress,
+                        ExportTag::kVideo | ExportTag::kStub);
 
 // VdVerifyMEInitCommand
 // r3
 // r4 = 19
 // no op?
 
-SHIM_CALL VdInitializeScalerCommandBuffer_shim(PPCContext* ppc_state,
-                                               KernelState* state) {
-  uint32_t unk0 = SHIM_GET_ARG_32(0);  // 0?
-  uint32_t unk1 = SHIM_GET_ARG_32(1);  // 0x050002d0 size of ?
-  uint32_t unk2 = SHIM_GET_ARG_32(2);  // 0?
-  uint32_t unk3 = SHIM_GET_ARG_32(3);  // 0x050002d0 size of ?
-  uint32_t unk4 = SHIM_GET_ARG_32(4);  // 0x050002d0 size of ?
-  uint32_t unk5 = SHIM_GET_ARG_32(5);  // 7?
-  uint32_t unk6 = SHIM_GET_ARG_32(6);  // 0x2004909c <-- points to zeros?
-  uint32_t unk7 = SHIM_GET_ARG_32(7);  // 7?
-  // arg8 is in stack!
-  uint32_t sp = (uint32_t)ppc_state->r[1];
-  // Points to the first 80000000h where the memcpy sources from.
-  uint32_t dest_ptr = SHIM_MEM_32(sp + 0x54);
-
-  XELOGD(
-      "VdInitializeScalerCommandBuffer(%.8X, %.8X, %.8X, %.8X, %.8X, %.8X, "
-      "%.8X, %.8X, %.8X)",
-      unk0, unk1, unk2, unk3, unk4, unk5, unk6, unk7, dest_ptr);
-
+dword_result_t VdInitializeScalerCommandBuffer(
+    unknown_t unk0,    // 0?
+    unknown_t unk1,    // 0x050002d0 size of ?
+    unknown_t unk2,    // 0?
+    unknown_t unk3,    // 0x050002d0 size of ?
+    unknown_t unk4,    // 0x050002d0 size of ?
+    unknown_t unk5,    // 7?
+    lpunknown_t unk6,  // 0x2004909c <-- points to zeros?
+    unknown_t unk7,    // 7?
+    lpvoid_t dest_ptr  // Points to the first 80000000h where the memcpy
+                       // sources from.
+    ) {
   // We could fake the commands here, but I'm not sure the game checks for
   // anything but success (non-zero ret).
   // For now, we just fill it with NOPs.
-  size_t total_words = 0x1CC / 4;
-  uint8_t* p = SHIM_MEM_ADDR(dest_ptr);
-  for (size_t i = 0; i < total_words; ++i, p += 4) {
-    poly::store_and_swap(p, 0x80000000);
+  uint32_t total_words = 0x1CC / 4;
+  auto dest = dest_ptr.as_array<uint32_t>();
+  for (size_t i = 0; i < total_words; ++i) {
+    dest[i] = 0x80000000;
   }
 
   // returns memcpy size >> 2 for memcpy(...,...,ret << 2)
-  SHIM_SET_RETURN_64(total_words >> 2);
+  return total_words >> 2;
 }
+DECLARE_XBOXKRNL_EXPORT(VdInitializeScalerCommandBuffer,
+                        ExportTag::kVideo | ExportTag::kSketchy);
 
 // We use these to shuffle data to VdSwap.
 // This way it gets properly stored in the command buffer (for replay/etc).
-static uint32_t last_frontbuffer_width_ = 1280;
-static uint32_t last_frontbuffer_height_ = 720;
+uint32_t last_frontbuffer_width_ = 1280;
+uint32_t last_frontbuffer_height_ = 720;
 
-SHIM_CALL VdCallGraphicsNotificationRoutines_shim(PPCContext* ppc_state,
-                                                  KernelState* state) {
-  uint32_t unk_1 = SHIM_GET_ARG_32(0);
-  uint32_t args_ptr = SHIM_GET_ARG_32(1);
+struct BufferScaling {
+  xe::be<uint16_t> fb_width;
+  xe::be<uint16_t> fb_height;
+  xe::be<uint16_t> bb_width;
+  xe::be<uint16_t> bb_height;
+};
+void AppendParam(StringBuffer& string_buffer, pointer_t<BufferScaling> param) {
+  string_buffer.AppendFormat(
+      "%.8X(scale %dx%d -> %dx%d))", param.guest_address(),
+      uint16_t(param->bb_width), uint16_t(param->bb_height),
+      uint16_t(param->fb_width), uint16_t(param->fb_height));
+}
 
-  assert_true(unk_1 == 1);
-
-  uint16_t fb_width = SHIM_MEM_16(args_ptr + 0);
-  uint16_t fb_height = SHIM_MEM_16(args_ptr + 2);
-  uint16_t bb_width = SHIM_MEM_16(args_ptr + 4);
-  uint16_t bb_height = SHIM_MEM_16(args_ptr + 6);
-
-  XELOGD("VdCallGraphicsNotificationRoutines(%d, %.8X(scale %dx%d -> %dx%d))",
-         unk_1, args_ptr, bb_width, bb_height, fb_width, fb_height);
+dword_result_t VdCallGraphicsNotificationRoutines(
+    unknown_t unk0, pointer_t<BufferScaling> args_ptr) {
+  assert_true(unk0 == 1);
 
   // TODO(benvanik): what does this mean, I forget:
   // callbacks get 0, r3, r4
 
   // For use by VdSwap.
-  last_frontbuffer_width_ = fb_width;
-  last_frontbuffer_height_ = fb_height;
+  last_frontbuffer_width_ = args_ptr->fb_width;
+  last_frontbuffer_height_ = args_ptr->fb_height;
 
-  SHIM_SET_RETURN_64(0);
+  return 0;
 }
+DECLARE_XBOXKRNL_EXPORT(VdCallGraphicsNotificationRoutines,
+                        ExportTag::kVideo | ExportTag::kSketchy);
 
-SHIM_CALL VdIsHSIOTrainingSucceeded_shim(PPCContext* ppc_state,
-                                         KernelState* state) {
-  XELOGD("VdIsHSIOTrainingSucceeded()");
-
+dword_result_t VdIsHSIOTrainingSucceeded() {
   // Not really sure what this should be - code does weird stuff here:
   // (cntlzw    r11, r3  / extrwi    r11, r11, 1, 26)
-  SHIM_SET_RETURN_64(1);
+  return 1;
 }
+DECLARE_XBOXKRNL_EXPORT(VdIsHSIOTrainingSucceeded,
+                        ExportTag::kVideo | ExportTag::kStub);
 
-SHIM_CALL VdPersistDisplay_shim(PPCContext* ppc_state, KernelState* state) {
-  XELOGD("VdPersistDisplay(?)");
+dword_result_t VdPersistDisplay(unknown_t unk0, lpdword_t unk1_ptr) {
+  // unk1_ptr needs to be populated with a pointer passed to
+  // MmFreePhysicalMemory(1, *unk1_ptr).
+  if (unk1_ptr) {
+    auto heap = kernel_memory()->LookupHeapByType(true, 16 * 1024);
+    uint32_t unk1_value;
+    heap->Alloc(64, 32, kMemoryAllocationReserve | kMemoryAllocationCommit,
+                kMemoryProtectNoAccess, false, &unk1_value);
+    *unk1_ptr = unk1_value;
+  }
 
-  // ?
-  SHIM_SET_RETURN_64(1);
+  return 1;
 }
+DECLARE_XBOXKRNL_EXPORT(VdPersistDisplay,
+                        ExportTag::kVideo | ExportTag::kSketchy);
 
-SHIM_CALL VdRetrainEDRAMWorker_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t unk0 = SHIM_GET_ARG_32(0);
+dword_result_t VdRetrainEDRAMWorker(unknown_t unk0) { return 0; }
+DECLARE_XBOXKRNL_EXPORT(VdRetrainEDRAMWorker,
+                        ExportTag::kVideo | ExportTag::kStub);
 
-  XELOGD("VdRetrainEDRAMWorker(%.8X)", unk0);
-
-  SHIM_SET_RETURN_64(0);
+dword_result_t VdRetrainEDRAM(unknown_t unk0, unknown_t unk1, unknown_t unk2,
+                              unknown_t unk3, unknown_t unk4, unknown_t unk5) {
+  return 0;
 }
+DECLARE_XBOXKRNL_EXPORT(VdRetrainEDRAM, ExportTag::kVideo | ExportTag::kStub);
 
-SHIM_CALL VdRetrainEDRAM_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t unk0 = SHIM_GET_ARG_32(0);
-  uint32_t unk1 = SHIM_GET_ARG_32(1);
-  uint32_t unk2 = SHIM_GET_ARG_32(2);
-  uint32_t unk3 = SHIM_GET_ARG_32(3);
-  uint32_t unk4 = SHIM_GET_ARG_32(4);
-  uint32_t unk5 = SHIM_GET_ARG_32(5);
+void VdSwap(lpvoid_t buffer_ptr,  // ptr into primary ringbuffer
+            lpvoid_t fetch_ptr,   // frontbuffer texture fetch
+            unknown_t unk2,       //
+            lpunknown_t unk3,     // buffer from VdGetSystemCommandBuffer
+            lpunknown_t unk4,     // from VdGetSystemCommandBuffer (0xBEEF0001)
+            lpdword_t frontbuffer_ptr,  // ptr to frontbuffer address
+            lpdword_t color_format_ptr, lpdword_t color_space_ptr,
+            lpunknown_t unk8, unknown_t unk9) {
+  gpu::xenos::xe_gpu_texture_fetch_t fetch;
+  xe::copy_and_swap_32_unaligned(
+      reinterpret_cast<uint32_t*>(&fetch),
+      reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
 
-  XELOGD("VdRetrainEDRAM(%.8X, %.8X, %.8X, %.8X, %.8X, %.8X)", unk0, unk1, unk2,
-         unk3, unk4, unk5);
-
-  SHIM_SET_RETURN_64(0);
-}
-
-SHIM_CALL VdSwap_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t unk0 = SHIM_GET_ARG_32(0);  // ptr into primary ringbuffer
-  uint32_t unk1 = SHIM_GET_ARG_32(1);
-  uint32_t unk2 = SHIM_GET_ARG_32(2);
-  uint32_t unk3 = SHIM_GET_ARG_32(3);             // ptr to 0xBEEF0000
-  uint32_t unk4 = SHIM_GET_ARG_32(4);             // 0xBEEF0001
-  uint32_t frontbuffer_ptr = SHIM_GET_ARG_32(5);  // ptr to frontbuffer address
-  uint32_t unk6 = SHIM_GET_ARG_32(6);             // ptr to 6?
-  uint32_t unk7 = SHIM_GET_ARG_32(7);
-
-  uint32_t frontbuffer = SHIM_MEM_32(frontbuffer_ptr);
-
-  XELOGD("VdSwap(%.8X, %.8X, %.8X, %.8X, %.8X, %.8X(%.8X), %.8X, %.8X)", unk0,
-         unk1, unk2, unk3, unk4, frontbuffer_ptr, frontbuffer, unk6, unk7);
+  auto color_format = gpu::xenos::ColorFormat(color_format_ptr.value());
+  auto color_space = *color_space_ptr;
+  assert_true(color_format == gpu::xenos::ColorFormat::k_8_8_8_8 ||
+              color_format == gpu::xenos::ColorFormat::kUnknown0x36);
+  assert_true(color_space == 0);
+  assert_true(*frontbuffer_ptr == fetch.address << 12);
+  assert_true(last_frontbuffer_width_ == 1 + fetch.size_2d.width);
+  assert_true(last_frontbuffer_height_ == 1 + fetch.size_2d.height);
 
   // The caller seems to reserve 64 words (256b) in the primary ringbuffer
   // for this method to do what it needs. We just zero them out and send a
   // token value. It'd be nice to figure out what this is really doing so
   // that we could simulate it, though due to TCR I bet all games need to
   // use this method.
-  memset(SHIM_MEM_ADDR(unk0), 0, 64 * 4);
-  auto dwords = reinterpret_cast<uint32_t*>(SHIM_MEM_ADDR(unk0));
-  dwords[0] = poly::byte_swap((0x3 << 30) | ((63 - 1) << 16) |
-                              (xe::gpu::xenos::PM4_XE_SWAP << 8));
-  dwords[1] = poly::byte_swap(frontbuffer);
+  buffer_ptr.Zero(64 * 4);
+
+  namespace xenos = xe::gpu::xenos;
+
+  auto dwords = buffer_ptr.as_array<uint32_t>();
+  dwords[0] = xenos::MakePacketType3<xenos::PM4_XE_SWAP, 63>();
+  dwords[1] = 'SWAP';
+  dwords[2] = *frontbuffer_ptr;
 
   // Set by VdCallGraphicsNotificationRoutines.
-  dwords[2] = poly::byte_swap(last_frontbuffer_width_);
-  dwords[3] = poly::byte_swap(last_frontbuffer_height_);
-
-  SHIM_SET_RETURN_64(0);
+  dwords[3] = last_frontbuffer_width_;
+  dwords[4] = last_frontbuffer_height_;
 }
+DECLARE_XBOXKRNL_EXPORT(VdSwap, ExportTag::kVideo | ExportTag::kImportant);
 
 }  // namespace kernel
 }  // namespace xe
 
-void xe::kernel::xboxkrnl::RegisterVideoExports(ExportResolver* export_resolver,
-                                                KernelState* state) {
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdGetCurrentDisplayGamma, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdGetCurrentDisplayInformation, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdQueryVideoFlags, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdQueryVideoMode, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdSetDisplayMode, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdSetDisplayModeOverride, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdInitializeEngines, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdShutdownEngines, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdGetGraphicsAsicID, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdEnableDisableClockGating, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdSetGraphicsInterruptCallback, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdInitializeRingBuffer, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdEnableRingBufferRPtrWriteBack, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdGetSystemCommandBuffer, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdSetSystemCommandBufferGpuIdentifierAddress,
-                   state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdInitializeScalerCommandBuffer, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdCallGraphicsNotificationRoutines, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdIsHSIOTrainingSucceeded, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdPersistDisplay, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdRetrainEDRAMWorker, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdRetrainEDRAM, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", VdSwap, state);
-
-  Memory* memory = state->memory();
+void xe::kernel::xboxkrnl::RegisterVideoExports(
+    xe::cpu::ExportResolver* export_resolver, KernelState* kernel_state) {
+  auto memory = kernel_state->memory();
 
   // VdGlobalDevice (4b)
   // Pointer to a global D3D device. Games only seem to set this, so we don't
@@ -455,7 +386,7 @@ void xe::kernel::xboxkrnl::RegisterVideoExports(ExportResolver* export_resolver,
       memory->SystemHeapAlloc(4, 32, kSystemHeapPhysical);
   export_resolver->SetVariableMapping("xboxkrnl.exe", ordinals::VdGlobalDevice,
                                       pVdGlobalDevice);
-  poly::store_and_swap<uint32_t>(memory->TranslateVirtual(pVdGlobalDevice), 0);
+  xe::store_and_swap<uint32_t>(memory->TranslateVirtual(pVdGlobalDevice), 0);
 
   // VdGlobalXamDevice (4b)
   // Pointer to the XAM D3D device, which we don't have.
@@ -463,8 +394,7 @@ void xe::kernel::xboxkrnl::RegisterVideoExports(ExportResolver* export_resolver,
       memory->SystemHeapAlloc(4, 32, kSystemHeapPhysical);
   export_resolver->SetVariableMapping(
       "xboxkrnl.exe", ordinals::VdGlobalXamDevice, pVdGlobalXamDevice);
-  poly::store_and_swap<uint32_t>(memory->TranslateVirtual(pVdGlobalXamDevice),
-                                 0);
+  xe::store_and_swap<uint32_t>(memory->TranslateVirtual(pVdGlobalXamDevice), 0);
 
   // VdGpuClockInMHz (4b)
   // GPU clock. Xenos is 500MHz. Hope nothing is relying on this timing...
@@ -472,8 +402,7 @@ void xe::kernel::xboxkrnl::RegisterVideoExports(ExportResolver* export_resolver,
       memory->SystemHeapAlloc(4, 32, kSystemHeapPhysical);
   export_resolver->SetVariableMapping("xboxkrnl.exe", ordinals::VdGpuClockInMHz,
                                       pVdGpuClockInMHz);
-  poly::store_and_swap<uint32_t>(memory->TranslateVirtual(pVdGpuClockInMHz),
-                                 500);
+  xe::store_and_swap<uint32_t>(memory->TranslateVirtual(pVdGpuClockInMHz), 500);
 
   // VdHSIOCalibrationLock (28b)
   // CriticalSection.

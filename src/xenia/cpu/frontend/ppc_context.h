@@ -10,21 +10,23 @@
 #ifndef XENIA_FRONTEND_PPC_CONTEXT_H_
 #define XENIA_FRONTEND_PPC_CONTEXT_H_
 
-#include "poly/poly.h"
-#include "poly/vec128.h"
+#include <cstdint>
+
+#include "xenia/base/vec128.h"
 
 namespace xe {
 namespace cpu {
-class Runtime;
+class Processor;
 class ThreadState;
 }  // namespace cpu
+namespace kernel {
+class KernelState;
+}  // namespace kernel
 }  // namespace xe
 
 namespace xe {
 namespace cpu {
 namespace frontend {
-
-using vec128_t = poly::vec128_t;
 
 // Map:
 // 0-31: GPR
@@ -38,7 +40,7 @@ using vec128_t = poly::vec128_t;
 // 100: invalid
 // 128-256: VR
 
-#pragma pack(push, 4)
+#pragma pack(push, 8)
 typedef struct alignas(64) PPCContext_s {
   // Must be stored at 0x0 for now.
   // TODO(benvanik): find a nice way to describe this to the JIT.
@@ -47,9 +49,11 @@ typedef struct alignas(64) PPCContext_s {
   uint8_t* virtual_membase;
 
   // Most frequently used registers first.
-  uint64_t r[32];  // General purpose registers
-  uint64_t lr;     // Link register
-  uint64_t ctr;    // Count register
+  uint64_t lr;      // Link register
+  uint64_t ctr;     // Count register
+  uint64_t r[32];   // General purpose registers
+  double f[32];     // Floating-point registers
+  vec128_t v[128];  // VMX128 vector registers
 
   // XER register
   // Split to make it easier to do individual updates.
@@ -186,9 +190,6 @@ typedef struct alignas(64) PPCContext_s {
 
   uint8_t vscr_sat;
 
-  double f[32];     // Floating-point registers
-  vec128_t v[128];  // VMX128 vector registers
-
   // uint32_t get_fprf() {
   //   return fpscr.value & 0x000F8000;
   // }
@@ -201,22 +202,28 @@ typedef struct alignas(64) PPCContext_s {
 
   // Reserve address for load acquire/store release. Shared.
   uint64_t* reserve_address;
-  uint64_t* reserve_value;
 
   // Used to shuttle data into externs. Contents volatile.
   uint64_t scratch;
 
-  // Runtime-specific data pointer. Used on callbacks to get access to the
+  // Processor-specific data pointer. Used on callbacks to get access to the
   // current runtime and its data.
-  Runtime* runtime;
+  Processor* processor;
+
+  // Shared kernel state, for easy access from kernel exports.
+  xe::kernel::KernelState* kernel_state;
 
   uint8_t* physical_membase;
+
+  // Keep the struct padded out to 64b total.
+  uint8_t _padding[8];
 
   void SetRegFromString(const char* name, const char* value);
   bool CompareRegWithString(const char* name, const char* value,
                             char* out_value, size_t out_value_size);
 } PPCContext;
 #pragma pack(pop)
+static_assert(sizeof(PPCContext) % 64 == 0, "64b padded");
 
 }  // namespace frontend
 }  // namespace cpu

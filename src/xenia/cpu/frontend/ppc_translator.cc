@@ -9,16 +9,25 @@
 
 #include "xenia/cpu/frontend/ppc_translator.h"
 
+#include <gflags/gflags.h>
+
+#include "xenia/base/assert.h"
+#include "xenia/base/byte_order.h"
+#include "xenia/base/memory.h"
+#include "xenia/base/reset_scope.h"
 #include "xenia/cpu/compiler/compiler_passes.h"
-#include "xenia/cpu/cpu-private.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/frontend/ppc_disasm.h"
 #include "xenia/cpu/frontend/ppc_frontend.h"
 #include "xenia/cpu/frontend/ppc_hir_builder.h"
 #include "xenia/cpu/frontend/ppc_instr.h"
 #include "xenia/cpu/frontend/ppc_scanner.h"
-#include "xenia/cpu/runtime.h"
-#include "poly/reset_scope.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/debug/debugger.h"
 #include "xenia/profiling.h"
+
+DEFINE_bool(preserve_hir_disasm, true,
+            "Preserves HIR disassembly for the debugger when it is attached.");
 
 namespace xe {
 namespace cpu {
@@ -32,12 +41,12 @@ using xe::cpu::compiler::Compiler;
 namespace passes = xe::cpu::compiler::passes;
 
 PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
-  Backend* backend = frontend->runtime()->backend();
+  Backend* backend = frontend->processor()->backend();
 
   scanner_.reset(new PPCScanner(frontend));
   builder_.reset(new PPCHIRBuilder(frontend));
-  compiler_.reset(new Compiler(frontend->runtime()));
-  assembler_ = std::move(backend->CreateAssembler());
+  compiler_.reset(new Compiler(frontend->processor()));
+  assembler_ = backend->CreateAssembler();
   assembler_->Initialize();
 
   bool validate = FLAGS_validate_hir;
@@ -46,7 +55,6 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // The CFG is required for simplification and dirtied by it.
   compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());
   compiler_->AddPass(std::make_unique<passes::ControlFlowSimplificationPass>());
-  compiler_->AddPass(std::make_unique<passes::ControlFlowAnalysisPass>());
 
   // Passes are executed in the order they are added. Multiple of the same
   // pass type may be used.
@@ -57,6 +65,14 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   if (validate) compiler_->AddPass(std::make_unique<passes::ValidationPass>());
   compiler_->AddPass(std::make_unique<passes::ConstantPropagationPass>());
   if (validate) compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  if (backend->machine_info()->supports_extended_load_store) {
+    // Backend supports the advanced LOAD/STORE instructions.
+    // These will save us a lot of HIR opcodes.
+    compiler_->AddPass(
+        std::make_unique<passes::MemorySequenceCombinationPass>());
+    if (validate)
+      compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  }
   compiler_->AddPass(std::make_unique<passes::SimplificationPass>());
   if (validate) compiler_->AddPass(std::make_unique<passes::ValidationPass>());
   // compiler_->AddPass(std::make_unique<passes::DeadStoreEliminationPass>());
@@ -83,40 +99,72 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
 
 PPCTranslator::~PPCTranslator() = default;
 
-int PPCTranslator::Translate(FunctionInfo* symbol_info,
-                             uint32_t debug_info_flags, uint32_t trace_flags,
-                             Function** out_function) {
+bool PPCTranslator::Translate(FunctionInfo* symbol_info,
+                              uint32_t debug_info_flags,
+                              Function** out_function) {
   SCOPE_profile_cpu_f("cpu");
 
   // Reset() all caching when we leave.
-  poly::make_reset_scope(builder_);
-  poly::make_reset_scope(compiler_);
-  poly::make_reset_scope(assembler_);
-  poly::make_reset_scope(&string_buffer_);
-
-  // Scan the function to find its extents. We only need to do this if we
-  // haven't already been provided with them from some other source.
-  if (!symbol_info->has_end_address()) {
-    // TODO(benvanik): find a way to remove the need for the scan. A fixup
-    //     scheme acting on branches could go back and modify calls to branches
-    //     if they are within the extents.
-    int result = scanner_->FindExtents(symbol_info);
-    if (result) {
-      return result;
-    }
-  }
+  xe::make_reset_scope(builder_);
+  xe::make_reset_scope(compiler_);
+  xe::make_reset_scope(assembler_);
+  xe::make_reset_scope(&string_buffer_);
 
   // NOTE: we only want to do this when required, as it's expensive to build.
-  if (FLAGS_always_disasm) {
-    debug_info_flags |= DEBUG_INFO_ALL_DISASM;
+  if (FLAGS_preserve_hir_disasm && frontend_->processor()->debugger() &&
+      frontend_->processor()->debugger()->is_attached()) {
+    debug_info_flags |= DebugInfoFlags::kDebugInfoDisasmRawHir |
+                        DebugInfoFlags::kDebugInfoDisasmHir;
+  }
+  if (FLAGS_disassemble_functions) {
+    debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
+  }
+  if (FLAGS_trace_functions) {
+    debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctions;
+  }
+  if (FLAGS_trace_function_coverage) {
+    debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctionCoverage;
+  }
+  if (FLAGS_trace_function_references) {
+    debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctionReferences;
+  }
+  if (FLAGS_trace_function_data) {
+    debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctionData;
   }
   std::unique_ptr<DebugInfo> debug_info;
   if (debug_info_flags) {
     debug_info.reset(new DebugInfo());
   }
 
+  // Scan the function to find its extents and gather debug data.
+  if (!scanner_->Scan(symbol_info, debug_info.get())) {
+    return false;
+  }
+
+  auto debugger = frontend_->processor()->debugger();
+  if (!debugger) {
+    debug_info_flags &= ~DebugInfoFlags::kDebugInfoAllTracing;
+  }
+
+  // Setup trace data, if needed.
+  if (debug_info_flags & DebugInfoFlags::kDebugInfoTraceFunctions) {
+    // Base trace data.
+    size_t trace_data_size = debug::FunctionTraceData::SizeOfHeader();
+    if (debug_info_flags & DebugInfoFlags::kDebugInfoTraceFunctionCoverage) {
+      // Additional space for instruction coverage counts.
+      trace_data_size += debug::FunctionTraceData::SizeOfInstructionCounts(
+          symbol_info->address(), symbol_info->end_address());
+    }
+    uint8_t* trace_data = debugger->AllocateFunctionTraceData(trace_data_size);
+    if (trace_data) {
+      debug_info->trace_data().Reset(trace_data, trace_data_size,
+                                     symbol_info->address(),
+                                     symbol_info->end_address());
+    }
+  }
+
   // Stash source.
-  if (debug_info_flags & DEBUG_INFO_SOURCE_DISASM) {
+  if (debug_info_flags & DebugInfoFlags::kDebugInfoDisasmSource) {
     DumpSource(symbol_info, &string_buffer_);
     debug_info->set_source_disasm(string_buffer_.ToString());
     string_buffer_.Reset();
@@ -131,55 +179,46 @@ int PPCTranslator::Translate(FunctionInfo* symbol_info,
   if (debug_info) {
     emit_flags |= PPCHIRBuilder::EMIT_DEBUG_COMMENTS;
   }
-  if (trace_flags & TRACE_SOURCE_VALUES) {
-    emit_flags |= PPCHIRBuilder::EMIT_TRACE_SOURCE_VALUES;
-  } else if (trace_flags & TRACE_SOURCE) {
-    emit_flags |= PPCHIRBuilder::EMIT_TRACE_SOURCE;
-  }
-  int result = builder_->Emit(symbol_info, emit_flags);
-  if (result) {
-    return result;
+  if (!builder_->Emit(symbol_info, emit_flags)) {
+    return false;
   }
 
   // Stash raw HIR.
-  if (debug_info_flags & DEBUG_INFO_RAW_HIR_DISASM) {
+  if (debug_info_flags & DebugInfoFlags::kDebugInfoDisasmRawHir) {
     builder_->Dump(&string_buffer_);
     debug_info->set_raw_hir_disasm(string_buffer_.ToString());
     string_buffer_.Reset();
   }
 
   // Compile/optimize/etc.
-  result = compiler_->Compile(builder_.get());
-  if (result) {
-    return result;
+  if (!compiler_->Compile(builder_.get())) {
+    return false;
   }
 
   // Stash optimized HIR.
-  if (debug_info_flags & DEBUG_INFO_HIR_DISASM) {
+  if (debug_info_flags & DebugInfoFlags::kDebugInfoDisasmHir) {
     builder_->Dump(&string_buffer_);
     debug_info->set_hir_disasm(string_buffer_.ToString());
     string_buffer_.Reset();
   }
 
   // Assemble to backend machine code.
-  result =
-      assembler_->Assemble(symbol_info, builder_.get(), debug_info_flags,
-                           std::move(debug_info), trace_flags, out_function);
-  if (result) {
-    return result;
+  if (!assembler_->Assemble(symbol_info, builder_.get(), debug_info_flags,
+                            std::move(debug_info), out_function)) {
+    return false;
   }
 
-  return 0;
+  return true;
 };
 
 void PPCTranslator::DumpSource(FunctionInfo* symbol_info,
-                               poly::StringBuffer* string_buffer) {
+                               StringBuffer* string_buffer) {
   Memory* memory = frontend_->memory();
 
-  string_buffer->Append("%s fn %.8X-%.8X %s\n",
-                        symbol_info->module()->name().c_str(),
-                        symbol_info->address(), symbol_info->end_address(),
-                        symbol_info->name().c_str());
+  string_buffer->AppendFormat(
+      "%s fn %.8X-%.8X %s\n", symbol_info->module()->name().c_str(),
+      symbol_info->address(), symbol_info->end_address(),
+      symbol_info->name().c_str());
 
   auto blocks = scanner_->FindBlocks(symbol_info);
 
@@ -190,19 +229,20 @@ void PPCTranslator::DumpSource(FunctionInfo* symbol_info,
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
     i.address = address;
-    i.code = poly::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    i.code = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
     // TODO(benvanik): find a way to avoid using the opcode tables.
     i.type = GetInstrType(i.code);
 
     // Check labels.
     if (block_it != blocks.end() && block_it->start_address == address) {
-      string_buffer->Append("%.8X          loc_%.8X:\n", address, address);
+      string_buffer->AppendFormat("%.8X          loc_%.8X:\n", address,
+                                  address);
       ++block_it;
     }
 
-    string_buffer->Append("%.8X %.8X   ", address, i.code);
+    string_buffer->AppendFormat("%.8X %.8X   ", address, i.code);
     DisasmPPC(i, string_buffer);
-    string_buffer->Append("\n");
+    string_buffer->Append('\n');
   }
 }
 

@@ -9,8 +9,7 @@
 
 #include "xenia/kernel/xam_module.h"
 
-#include "poly/math.h"
-#include "xenia/export_resolver.h"
+#include "xenia/base/math.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xam_private.h"
 
@@ -18,37 +17,49 @@ namespace xe {
 namespace kernel {
 
 XamModule::XamModule(Emulator* emulator, KernelState* kernel_state)
-    : XKernelModule(kernel_state, "xe:\\xam.xex") {
+    : XKernelModule(kernel_state, "xe:\\xam.xex"), loader_data_() {
   RegisterExportTable(export_resolver_);
 
   // Register all exported functions.
+  xam::RegisterAvatarExports(export_resolver_, kernel_state_);
   xam::RegisterContentExports(export_resolver_, kernel_state_);
   xam::RegisterInfoExports(export_resolver_, kernel_state_);
   xam::RegisterInputExports(export_resolver_, kernel_state_);
   xam::RegisterMsgExports(export_resolver_, kernel_state_);
   xam::RegisterNetExports(export_resolver_, kernel_state_);
   xam::RegisterNotifyExports(export_resolver_, kernel_state_);
+  xam::RegisterNuiExports(export_resolver_, kernel_state_);
   xam::RegisterUIExports(export_resolver_, kernel_state_);
   xam::RegisterUserExports(export_resolver_, kernel_state_);
   xam::RegisterVideoExports(export_resolver_, kernel_state_);
   xam::RegisterVoiceExports(export_resolver_, kernel_state_);
 }
 
-void XamModule::RegisterExportTable(ExportResolver* export_resolver) {
+std::vector<xe::cpu::Export*> xam_exports(4096);
+
+xe::cpu::Export* RegisterExport_xam(xe::cpu::Export* export_entry) {
+  assert_true(export_entry->ordinal < xam_exports.size());
+  xam_exports[export_entry->ordinal] = export_entry;
+  return export_entry;
+}
+
+void XamModule::RegisterExportTable(xe::cpu::ExportResolver* export_resolver) {
   assert_not_null(export_resolver);
 
-  if (!export_resolver) {
-    return;
-  }
-
-  // Build the export table used for resolution.
+// Build the export table used for resolution.
 #include "xenia/kernel/util/export_table_pre.inc"
-  static KernelExport xam_export_table[] = {
+  static xe::cpu::Export xam_export_table[] = {
 #include "xenia/kernel/xam_table.inc"
   };
 #include "xenia/kernel/util/export_table_post.inc"
-  export_resolver->RegisterTable("xam.xex", xam_export_table,
-    poly::countof(xam_export_table));
+  for (size_t i = 0; i < xe::countof(xam_export_table); ++i) {
+    auto& export_entry = xam_export_table[i];
+    assert_true(export_entry.ordinal < xam_exports.size());
+    if (!xam_exports[export_entry.ordinal]) {
+      xam_exports[export_entry.ordinal] = &export_entry;
+    }
+  }
+  export_resolver->RegisterTable("xam.xex", &xam_exports);
 }
 
 XamModule::~XamModule() {}

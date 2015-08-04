@@ -7,31 +7,31 @@
  ******************************************************************************
  */
 
+#include "xenia/base/logging.h"
 #include "xenia/kernel/objects/xevent.h"
 
 namespace xe {
 namespace kernel {
 
-XEvent::XEvent(KernelState* kernel_state)
-    : XObject(kernel_state, kTypeEvent), handle_(NULL) {}
+XEvent::XEvent(KernelState* kernel_state) : XObject(kernel_state, kTypeEvent) {}
 
-XEvent::~XEvent() {
-  if (handle_) {
-    CloseHandle(handle_);
+XEvent::~XEvent() = default;
+
+void XEvent::Initialize(bool manual_reset, bool initial_state) {
+  assert_false(event_);
+
+  if (manual_reset) {
+    event_ = xe::threading::Event::CreateManualResetEvent(initial_state);
+  } else {
+    event_ = xe::threading::Event::CreateAutoResetEvent(initial_state);
   }
 }
 
-void XEvent::Initialize(bool manual_reset, bool initial_state) {
-  assert_null(handle_);
-
-  handle_ = CreateEvent(NULL, manual_reset, initial_state, NULL);
-}
-
-void XEvent::InitializeNative(void* native_ptr, DISPATCH_HEADER& header) {
-  assert_null(handle_);
+void XEvent::InitializeNative(void* native_ptr, X_DISPATCH_HEADER& header) {
+  assert_false(event_);
 
   bool manual_reset;
-  switch (header.type_flags >> 24) {
+  switch (header.type) {
     case 0x00:  // EventNotificationObject (manual reset)
       manual_reset = true;
       break;
@@ -44,21 +44,25 @@ void XEvent::InitializeNative(void* native_ptr, DISPATCH_HEADER& header) {
   }
 
   bool initial_state = header.signal_state ? true : false;
-
-  handle_ = CreateEvent(NULL, manual_reset, initial_state, NULL);
+  Initialize(manual_reset, initial_state);
 }
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
-  return SetEvent(handle_) ? 1 : 0;
+  event_->Set();
+  return 1;
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
-  return PulseEvent(handle_) ? 1 : 0;
+  event_->Pulse();
+  return 1;
 }
 
-int32_t XEvent::Reset() { return ResetEvent(handle_) ? 1 : 0; }
+int32_t XEvent::Reset() {
+  event_->Reset();
+  return 1;
+}
 
-void XEvent::Clear() { ResetEvent(handle_); }
+void XEvent::Clear() { event_->Reset(); }
 
 }  // namespace kernel
 }  // namespace xe

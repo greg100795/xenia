@@ -15,17 +15,17 @@ namespace xe {
 namespace cpu {
 namespace compiler {
 
-CompilerPass::CompilerPass() : runtime_(0), compiler_(0) {}
+CompilerPass::CompilerPass() : processor_(nullptr), compiler_(nullptr) {}
 
 CompilerPass::~CompilerPass() = default;
 
-int CompilerPass::Initialize(Compiler* compiler) {
-  runtime_ = compiler->runtime();
+bool CompilerPass::Initialize(Compiler* compiler) {
+  processor_ = compiler->processor();
   compiler_ = compiler;
-  return 0;
+  return true;
 }
 
-poly::Arena* CompilerPass::scratch_arena() const {
+Arena* CompilerPass::scratch_arena() const {
   return compiler_->scratch_arena();
 }
 

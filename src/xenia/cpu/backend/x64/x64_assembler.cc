@@ -9,18 +9,17 @@
 
 #include "xenia/cpu/backend/x64/x64_assembler.h"
 
+#include "third_party/capstone/include/capstone.h"
+#include "third_party/capstone/include/x86.h"
+#include "xenia/base/reset_scope.h"
 #include "xenia/cpu/backend/x64/x64_backend.h"
 #include "xenia/cpu/backend/x64/x64_emitter.h"
 #include "xenia/cpu/backend/x64/x64_function.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/hir/hir_builder.h"
 #include "xenia/cpu/hir/label.h"
-#include "xenia/cpu/runtime.h"
-#include "poly/reset_scope.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/profiling.h"
-
-namespace BE {
-#include <beaengine/BeaEngine.h>
-}  // namespace BE
 
 namespace xe {
 namespace cpu {
@@ -33,24 +32,33 @@ using namespace xe::cpu;
 using xe::cpu::hir::HIRBuilder;
 
 X64Assembler::X64Assembler(X64Backend* backend)
-    : Assembler(backend), x64_backend_(backend) {}
+    : Assembler(backend), x64_backend_(backend), capstone_handle_(0) {
+  if (cs_open(CS_ARCH_X86, CS_MODE_64, &capstone_handle_) != CS_ERR_OK) {
+    assert_always("Failed to initialize capstone");
+  }
+  cs_option(capstone_handle_, CS_OPT_SYNTAX, CS_OPT_SYNTAX_INTEL);
+  cs_option(capstone_handle_, CS_OPT_DETAIL, CS_OPT_OFF);
+}
 
 X64Assembler::~X64Assembler() {
   // Emitter must be freed before the allocator.
   emitter_.reset();
   allocator_.reset();
+
+  if (capstone_handle_) {
+    cs_close(&capstone_handle_);
+  }
 }
 
-int X64Assembler::Initialize() {
-  int result = Assembler::Initialize();
-  if (result) {
-    return result;
+bool X64Assembler::Initialize() {
+  if (!Assembler::Initialize()) {
+    return false;
   }
 
   allocator_.reset(new XbyakAllocator());
   emitter_.reset(new X64Emitter(x64_backend_, allocator_.get()));
 
-  return result;
+  return true;
 }
 
 void X64Assembler::Reset() {
@@ -58,71 +66,78 @@ void X64Assembler::Reset() {
   Assembler::Reset();
 }
 
-int X64Assembler::Assemble(FunctionInfo* symbol_info, HIRBuilder* builder,
-                           uint32_t debug_info_flags,
-                           std::unique_ptr<DebugInfo> debug_info,
-                           uint32_t trace_flags, Function** out_function) {
+bool X64Assembler::Assemble(FunctionInfo* symbol_info, HIRBuilder* builder,
+                            uint32_t debug_info_flags,
+                            std::unique_ptr<DebugInfo> debug_info,
+                            Function** out_function) {
   SCOPE_profile_cpu_f("cpu");
 
   // Reset when we leave.
-  poly::make_reset_scope(this);
+  xe::make_reset_scope(this);
+
+  // Create now, and populate as we go.
+  // We may throw it away if we fail.
+  auto fn = std::make_unique<X64Function>(symbol_info);
 
   // Lower HIR -> x64.
-  void* machine_code = 0;
+  void* machine_code = nullptr;
   size_t code_size = 0;
-  int result = emitter_->Emit(builder, debug_info_flags, debug_info.get(),
-                              trace_flags, machine_code, code_size);
-  if (result) {
-    return result;
+  if (!emitter_->Emit(symbol_info, builder, debug_info_flags, debug_info.get(),
+                      machine_code, code_size, fn->source_map())) {
+    return false;
   }
 
   // Stash generated machine code.
-  if (debug_info_flags & DebugInfoFlags::DEBUG_INFO_MACHINE_CODE_DISASM) {
-    DumpMachineCode(debug_info.get(), machine_code, code_size, &string_buffer_);
+  if (debug_info_flags & DebugInfoFlags::kDebugInfoDisasmMachineCode) {
+    DumpMachineCode(machine_code, code_size, fn->source_map(), &string_buffer_);
     debug_info->set_machine_code_disasm(string_buffer_.ToString());
     string_buffer_.Reset();
   }
 
-  {
-    X64Function* fn = new X64Function(symbol_info);
-    fn->set_debug_info(std::move(debug_info));
-    fn->Setup(machine_code, code_size);
-
-    *out_function = fn;
+  // Dump debug data.
+  if (FLAGS_disassemble_functions) {
+    if (debug_info_flags & DebugInfoFlags::kDebugInfoDisasmSource) {
+      // auto fn_data = backend_->processor()->debugger()->AllocateFunctionData(
+      //    xe::debug::FunctionDisasmData::SizeOfHeader());
+    }
   }
 
-  return 0;
+  fn->set_debug_info(std::move(debug_info));
+  fn->Setup(reinterpret_cast<uint8_t*>(machine_code), code_size);
+
+  // Pass back ownership.
+  *out_function = fn.release();
+  return true;
 }
 
-void X64Assembler::DumpMachineCode(DebugInfo* debug_info, void* machine_code,
-                                   size_t code_size, poly::StringBuffer* str) {
-  BE::DISASM disasm = {0};
-  disasm.Archi = 64;
-  disasm.Options = BE::Tabulation + BE::MasmSyntax + BE::PrefixedNumeral;
-  disasm.EIP = (BE::UIntPtr)machine_code;
-  BE::UIntPtr eip_end = disasm.EIP + code_size;
-  uint64_t prev_source_offset = 0;
-  while (disasm.EIP < eip_end) {
+void X64Assembler::DumpMachineCode(
+    void* machine_code, size_t code_size,
+    const std::vector<SourceMapEntry>& source_map, StringBuffer* str) {
+  auto source_map_index = 0;
+  uint32_t next_code_offset = source_map[0].code_offset;
+
+  const uint8_t* code_ptr = reinterpret_cast<uint8_t*>(machine_code);
+  size_t remaining_code_size = code_size;
+  uint64_t address = uint64_t(machine_code);
+  cs_insn insn = {0};
+  while (remaining_code_size &&
+         cs_disasm_iter(capstone_handle_, &code_ptr, &remaining_code_size,
+                        &address, &insn)) {
     // Look up source offset.
-    auto map_entry =
-        debug_info->LookupCodeOffset(disasm.EIP - (BE::UIntPtr)machine_code);
-    if (map_entry) {
-      if (map_entry->source_offset == prev_source_offset) {
-        str->Append("         ");
-      } else {
-        str->Append("%.8X ", map_entry->source_offset);
-        prev_source_offset = map_entry->source_offset;
-      }
+    auto code_offset =
+        uint32_t(code_ptr - reinterpret_cast<uint8_t*>(machine_code));
+    if (code_offset >= next_code_offset &&
+        source_map_index < source_map.size()) {
+      auto& source_map_entry = source_map[source_map_index];
+      str->AppendFormat("%.8X ", source_map_entry.source_offset);
+      ++source_map_index;
+      next_code_offset = source_map[source_map_index].code_offset;
     } else {
-      str->Append("?        ");
+      str->Append("         ");
     }
 
-    size_t len = BE::Disasm(&disasm);
-    if (len == BE::UNKNOWN_OPCODE) {
-      break;
-    }
-    str->Append("%p  %s\n", disasm.EIP, disasm.CompleteInstr);
-    disasm.EIP += len;
+    str->AppendFormat("%.8X      %-6s %s\n", uint32_t(insn.address),
+                      insn.mnemonic, insn.op_str);
   }
 }
 

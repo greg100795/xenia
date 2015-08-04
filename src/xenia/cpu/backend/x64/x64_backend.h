@@ -10,7 +10,13 @@
 #ifndef XENIA_BACKEND_X64_X64_BACKEND_H_
 #define XENIA_BACKEND_X64_X64_BACKEND_H_
 
+#include <gflags/gflags.h>
+
+#include <memory>
+
 #include "xenia/cpu/backend/backend.h"
+
+DECLARE_bool(enable_haswell_instructions);
 
 namespace xe {
 namespace cpu {
@@ -23,24 +29,41 @@ class X64CodeCache;
 
 typedef void* (*HostToGuestThunk)(void* target, void* arg0, void* arg1);
 typedef void* (*GuestToHostThunk)(void* target, void* arg0, void* arg1);
+typedef void (*ResolveFunctionThunk)();
 
 class X64Backend : public Backend {
  public:
-  X64Backend(Runtime* runtime);
+  const static uint32_t kForceReturnAddress = 0x9FFF0000u;
+
+  X64Backend(Processor* processor);
   ~X64Backend() override;
 
-  X64CodeCache* code_cache() const { return code_cache_; }
-  HostToGuestThunk host_to_guest_thunk() const { return host_to_guest_thunk_; }
-  GuestToHostThunk guest_to_host_thunk() const { return guest_to_host_thunk_; }
+  X64CodeCache* code_cache() const { return code_cache_.get(); }
+  uint32_t emitter_data() const { return emitter_data_; }
 
-  int Initialize() override;
+  // Call a generated function, saving all stack parameters.
+  HostToGuestThunk host_to_guest_thunk() const { return host_to_guest_thunk_; }
+  // Function that guest code can call to transition into host code.
+  GuestToHostThunk guest_to_host_thunk() const { return guest_to_host_thunk_; }
+  // Function that thunks to the ResolveFunction in X64Emitter.
+  ResolveFunctionThunk resolve_function_thunk() const {
+    return resolve_function_thunk_;
+  }
+
+  bool Initialize() override;
+
+  void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) override;
 
   std::unique_ptr<Assembler> CreateAssembler() override;
 
  private:
-  X64CodeCache* code_cache_;
+  std::unique_ptr<X64CodeCache> code_cache_;
+
+  uint32_t emitter_data_;
+
   HostToGuestThunk host_to_guest_thunk_;
   GuestToHostThunk guest_to_host_thunk_;
+  ResolveFunctionThunk resolve_function_thunk_;
 };
 
 }  // namespace x64

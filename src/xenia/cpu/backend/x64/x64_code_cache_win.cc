@@ -2,131 +2,151 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2013 Ben Vanik. All rights reserved.                             *
+ * Copyright 2015 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
 
 #include "xenia/cpu/backend/x64/x64_code_cache.h"
 
-#include "poly/poly.h"
+#include <cstdlib>
+#include <cstring>
+
+#include "xenia/base/assert.h"
+#include "xenia/base/clock.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/base/memory.h"
+#include "xenia/base/platform_win.h"
+
+// When enabled, this will use Windows 8 APIs to get unwind info.
+// TODO(benvanik): figure out why the callback variant doesn't work.
+#define USE_GROWABLE_FUNCTION_TABLE
 
 namespace xe {
 namespace cpu {
 namespace backend {
 namespace x64 {
 
-class X64CodeChunk {
+// Size of unwind info per function.
+// TODO(benvanik): move this to emitter.
+const static uint32_t kUnwindInfoSize = 4 + (2 * 1 + 2 + 2);
+
+class Win32X64CodeCache : public X64CodeCache {
  public:
-  X64CodeChunk(size_t chunk_size);
-  ~X64CodeChunk();
+  Win32X64CodeCache();
+  ~Win32X64CodeCache() override;
 
- public:
-  X64CodeChunk* next;
-  size_t capacity;
-  uint8_t* buffer;
-  size_t offset;
+  bool Initialize() override;
 
-  // Estimate of function sized use to determine initial table capacity.
-  const static uint32_t ESTIMATED_FN_SIZE = 512;
-  // Size of unwind info per function.
-  // TODO(benvanik): move this to emitter.
-  const static uint32_t UNWIND_INFO_SIZE = 4 + (2 * 1 + 2 + 2);
+  void* LookupUnwindInfo(uint64_t host_pc) override;
 
-  void* fn_table_handle;
-  RUNTIME_FUNCTION* fn_table;
-  uint32_t fn_table_count;
-  uint32_t fn_table_capacity;
+ private:
+  UnwindReservation RequestUnwindReservation(uint8_t* entry_address) override;
+  void PlaceCode(uint32_t guest_address, void* machine_code, size_t code_size,
+                 size_t stack_size, void* code_address,
+                 UnwindReservation unwind_reservation) override;
 
-  void AddTableEntry(uint8_t* code, size_t code_size, size_t stack_size);
+  void InitializeUnwindEntry(uint8_t* unwind_entry_address,
+                             size_t unwind_table_slot, void* code_address,
+                             size_t code_size, size_t stack_size);
+
+  // Growable function table system handle.
+  void* unwind_table_handle_ = nullptr;
+  // Actual unwind table entries.
+  std::vector<RUNTIME_FUNCTION> unwind_table_;
+  // Current number of entries in the table.
+  std::atomic<uint32_t> unwind_table_count_ = {0};
 };
 
-X64CodeCache::X64CodeCache(size_t chunk_size)
-    : chunk_size_(chunk_size), head_chunk_(NULL), active_chunk_(NULL) {}
-
-X64CodeCache::~X64CodeCache() {
-  std::lock_guard<std::mutex> guard(lock_);
-  auto chunk = head_chunk_;
-  while (chunk) {
-    auto next = chunk->next;
-    delete chunk;
-    chunk = next;
-  }
-  head_chunk_ = NULL;
+std::unique_ptr<X64CodeCache> X64CodeCache::Create() {
+  return std::make_unique<Win32X64CodeCache>();
 }
 
-int X64CodeCache::Initialize() { return 0; }
+Win32X64CodeCache::Win32X64CodeCache() = default;
 
-void* X64CodeCache::PlaceCode(void* machine_code, size_t code_size,
-                              size_t stack_size) {
-  size_t alloc_size = code_size;
+Win32X64CodeCache::~Win32X64CodeCache() {
+#ifdef USE_GROWABLE_FUNCTION_TABLE
+  if (unwind_table_handle_) {
+    RtlDeleteGrowableFunctionTable(unwind_table_handle_);
+  }
+#else
+  if (generated_code_base_) {
+    RtlDeleteFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(
+        reinterpret_cast<DWORD64>(generated_code_base_) | 0x3));
+  }
+#endif  // USE_GROWABLE_FUNCTION_TABLE
+}
 
-  // Add unwind info into the allocation size. Keep things 16b aligned.
-  alloc_size += poly::round_up(X64CodeChunk::UNWIND_INFO_SIZE, 16);
-
-  // Always move the code to land on 16b alignment. We do this by rounding up
-  // to 16b so that all offsets are aligned.
-  alloc_size = poly::round_up(alloc_size, 16);
-
-  lock_.lock();
-
-  if (active_chunk_) {
-    if (active_chunk_->capacity - active_chunk_->offset < alloc_size) {
-      auto next = active_chunk_->next;
-      if (!next) {
-        assert_true(alloc_size < chunk_size_, "need to support larger chunks");
-        next = new X64CodeChunk(chunk_size_);
-        active_chunk_->next = next;
-      }
-      active_chunk_ = next;
-    }
-  } else {
-    head_chunk_ = active_chunk_ = new X64CodeChunk(chunk_size_);
+bool Win32X64CodeCache::Initialize() {
+  if (!X64CodeCache::Initialize()) {
+    return false;
   }
 
-  uint8_t* final_address = active_chunk_->buffer + active_chunk_->offset;
-  active_chunk_->offset += alloc_size;
+  // Compute total number of unwind entries we should allocate.
+  // We don't support reallocing right now, so this should be high.
+  unwind_table_.resize(kMaximumFunctionCount);
 
-  // Add entry to fn table.
-  active_chunk_->AddTableEntry(final_address, alloc_size, stack_size);
+#ifdef USE_GROWABLE_FUNCTION_TABLE
+  // Create table and register with the system. It's empty now, but we'll grow
+  // it as functions are added.
+  if (RtlAddGrowableFunctionTable(
+          &unwind_table_handle_, unwind_table_.data(), unwind_table_count_,
+          DWORD(unwind_table_.size()),
+          reinterpret_cast<ULONG_PTR>(generated_code_base_),
+          reinterpret_cast<ULONG_PTR>(generated_code_base_ +
+                                      kGeneratedCodeSize))) {
+    XELOGE("Unable to create unwind function table");
+    return false;
+  }
+#else
+  // Install a callback that the debugger will use to lookup unwind info on
+  // demand.
+  if (!RtlInstallFunctionTableCallback(
+          reinterpret_cast<DWORD64>(generated_code_base_) | 0x3,
+          reinterpret_cast<DWORD64>(generated_code_base_),
+          kGeneratedCodeSize, [](uintptr_t control_pc, void* context) {
+            auto code_cache = reinterpret_cast<X64CodeCache*>(context);
+            return reinterpret_cast<PRUNTIME_FUNCTION>(
+                code_cache->LookupUnwindEntry(control_pc));
+          }, this, nullptr)) {
+    XELOGE("Unable to install function table callback");
+    return false;
+  }
+#endif  // USE_GROWABLE_FUNCTION_TABLE
 
-  lock_.unlock();
+  return true;
+}
 
-  // Copy code.
-  memcpy(final_address, machine_code, code_size);
+Win32X64CodeCache::UnwindReservation
+Win32X64CodeCache::RequestUnwindReservation(uint8_t* entry_address) {
+  UnwindReservation unwind_reservation;
+  unwind_reservation.data_size = xe::round_up(kUnwindInfoSize, 16);
+  unwind_reservation.table_slot = ++unwind_table_count_;
+  unwind_reservation.entry_address = entry_address;
+  return unwind_reservation;
+}
+
+void Win32X64CodeCache::PlaceCode(uint32_t guest_address, void* machine_code,
+                                  size_t code_size, size_t stack_size,
+                                  void* code_address,
+                                  UnwindReservation unwind_reservation) {
+  // Add unwind info.
+  InitializeUnwindEntry(unwind_reservation.entry_address,
+                        unwind_reservation.table_slot, code_address, code_size,
+                        stack_size);
+
+#ifdef USE_GROWABLE_FUNCTION_TABLE
+  // Notify that the unwind table has grown.
+  // We do this outside of the lock, but with the latest total count.
+  RtlGrowFunctionTable(unwind_table_handle_, unwind_table_count_);
+#endif  // USE_GROWABLE_FUNCTION_TABLE
 
   // This isn't needed on x64 (probably), but is convention.
-  FlushInstructionCache(GetCurrentProcess(), final_address, alloc_size);
-  return final_address;
-}
-
-X64CodeChunk::X64CodeChunk(size_t chunk_size)
-    : next(NULL), capacity(chunk_size), buffer(0), offset(0) {
-  buffer = (uint8_t*)VirtualAlloc(NULL, capacity, MEM_RESERVE | MEM_COMMIT,
-                                  PAGE_EXECUTE_READWRITE);
-
-  fn_table_capacity =
-      static_cast<uint32_t>(poly::round_up(capacity / ESTIMATED_FN_SIZE, 16));
-  size_t table_size = fn_table_capacity * sizeof(RUNTIME_FUNCTION);
-  fn_table = (RUNTIME_FUNCTION*)malloc(table_size);
-  fn_table_count = 0;
-  fn_table_handle = 0;
-  RtlAddGrowableFunctionTable(&fn_table_handle, fn_table, fn_table_count,
-                              fn_table_capacity, (ULONG_PTR)buffer,
-                              (ULONG_PTR)buffer + capacity);
-}
-
-X64CodeChunk::~X64CodeChunk() {
-  if (fn_table_handle) {
-    RtlDeleteGrowableFunctionTable(fn_table_handle);
-  }
-  if (buffer) {
-    VirtualFree(buffer, 0, MEM_RELEASE);
-  }
+  FlushInstructionCache(GetCurrentProcess(), code_address, code_size);
 }
 
 // http://msdn.microsoft.com/en-us/library/ssa62fwe.aspx
-namespace {
 typedef enum _UNWIND_OP_CODES {
   UWOP_PUSH_NONVOL = 0, /* info == register number */
   UWOP_ALLOC_LARGE,     /* no info, alloc size in next 2 slots */
@@ -184,38 +204,16 @@ typedef struct _UNWIND_INFO {
   *   };
   *   OPTIONAL ULONG ExceptionData[]; */
 } UNWIND_INFO, *PUNWIND_INFO;
-}  // namespace
 
-void X64CodeChunk::AddTableEntry(uint8_t* code, size_t code_size,
-                                 size_t stack_size) {
-  // NOTE: we assume a chunk lock.
-
-  if (fn_table_count + 1 > fn_table_capacity) {
-    // Table exhausted, need to realloc. If this happens a lot we should tune
-    // the table size to prevent this.
-    PLOGW("X64CodeCache growing FunctionTable - adjust ESTIMATED_FN_SIZE");
-    RtlDeleteGrowableFunctionTable(fn_table_handle);
-    size_t old_size = fn_table_capacity * sizeof(RUNTIME_FUNCTION);
-    size_t new_size = old_size * 2;
-    auto new_table = (RUNTIME_FUNCTION*)realloc(fn_table, new_size);
-    assert_not_null(new_table);
-    if (!new_table) {
-      return;
-    }
-    fn_table = new_table;
-    fn_table_capacity *= 2;
-    RtlAddGrowableFunctionTable(&fn_table_handle, fn_table, fn_table_count,
-                                fn_table_capacity, (ULONG_PTR)buffer,
-                                (ULONG_PTR)buffer + capacity);
-  }
-
-  // Allocate unwind data. We know we have space because we overallocated.
-  // This should be the tailing 16b with 16b alignment.
-  size_t unwind_info_offset = offset - UNWIND_INFO_SIZE;
+void Win32X64CodeCache::InitializeUnwindEntry(uint8_t* unwind_entry_address,
+                                              size_t unwind_table_slot,
+                                              void* code_address,
+                                              size_t code_size,
+                                              size_t stack_size) {
+  auto unwind_info = reinterpret_cast<UNWIND_INFO*>(unwind_entry_address);
 
   if (!stack_size) {
     // http://msdn.microsoft.com/en-us/library/ddssxxy8.aspx
-    UNWIND_INFO* unwind_info = (UNWIND_INFO*)(buffer + unwind_info_offset);
     unwind_info->Version = 1;
     unwind_info->Flags = 0;
     unwind_info->SizeOfProlog = 0;
@@ -226,7 +224,6 @@ void X64CodeChunk::AddTableEntry(uint8_t* code, size_t code_size,
     uint8_t prolog_size = 4;
 
     // http://msdn.microsoft.com/en-us/library/ddssxxy8.aspx
-    UNWIND_INFO* unwind_info = (UNWIND_INFO*)(buffer + unwind_info_offset);
     unwind_info->Version = 1;
     unwind_info->Flags = 0;
     unwind_info->SizeOfProlog = prolog_size;
@@ -246,11 +243,10 @@ void X64CodeChunk::AddTableEntry(uint8_t* code, size_t code_size,
     uint8_t prolog_size = 7;
 
     // http://msdn.microsoft.com/en-us/library/ddssxxy8.aspx
-    UNWIND_INFO* unwind_info = (UNWIND_INFO*)(buffer + unwind_info_offset);
     unwind_info->Version = 1;
     unwind_info->Flags = 0;
     unwind_info->SizeOfProlog = prolog_size;
-    unwind_info->CountOfCodes = 3;
+    unwind_info->CountOfCodes = 2;
     unwind_info->FrameRegister = 0;
     unwind_info->FrameOffset = 0;
 
@@ -266,13 +262,29 @@ void X64CodeChunk::AddTableEntry(uint8_t* code, size_t code_size,
   }
 
   // Add entry.
-  auto& fn_entry = fn_table[fn_table_count++];
-  fn_entry.BeginAddress = (DWORD)(code - buffer);
+  auto& fn_entry = unwind_table_[unwind_table_slot];
+  fn_entry.BeginAddress =
+      (DWORD)(reinterpret_cast<uint8_t*>(code_address) - generated_code_base_);
   fn_entry.EndAddress = (DWORD)(fn_entry.BeginAddress + code_size);
-  fn_entry.UnwindData = (DWORD)unwind_info_offset;
+  fn_entry.UnwindData = (DWORD)(unwind_entry_address - generated_code_base_);
+}
 
-  // Notify the function table that it has new entries.
-  RtlGrowFunctionTable(fn_table_handle, fn_table_count);
+void* Win32X64CodeCache::LookupUnwindInfo(uint64_t host_pc) {
+  return std::bsearch(
+      &host_pc, unwind_table_.data(), unwind_table_count_ + 1,
+      sizeof(RUNTIME_FUNCTION),
+      [](const void* key_ptr, const void* element_ptr) {
+        auto key =
+            *reinterpret_cast<const uintptr_t*>(key_ptr) - kGeneratedCodeBase;
+        auto element = reinterpret_cast<const RUNTIME_FUNCTION*>(element_ptr);
+        if (key < element->BeginAddress) {
+          return -1;
+        } else if (key > element->EndAddress) {
+          return 1;
+        } else {
+          return 0;
+        }
+      });
 }
 
 }  // namespace x64

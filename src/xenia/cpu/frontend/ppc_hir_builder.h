@@ -10,10 +10,10 @@
 #ifndef XENIA_FRONTEND_PPC_HIR_BUILDER_H_
 #define XENIA_FRONTEND_PPC_HIR_BUILDER_H_
 
+#include "xenia/base/string_buffer.h"
 #include "xenia/cpu/hir/hir_builder.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/symbol_info.h"
-#include "poly/string_buffer.h"
 
 namespace xe {
 namespace cpu {
@@ -35,12 +35,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   enum EmitFlags {
     // Emit comment nodes.
     EMIT_DEBUG_COMMENTS = 1 << 0,
-    // Emit TraceSource nodes.
-    EMIT_TRACE_SOURCE = 1 << 1,
-    // Emit TraceSource nodes with the resulting values of the operations.
-    EMIT_TRACE_SOURCE_VALUES = EMIT_TRACE_SOURCE | (1 << 2),
   };
-  int Emit(FunctionInfo* symbol_info, uint32_t flags);
+  bool Emit(FunctionInfo* symbol_info, uint32_t flags);
 
   FunctionInfo* symbol_info() const { return symbol_info_; }
   FunctionInfo* LookupFunction(uint32_t address);
@@ -91,7 +87,7 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   PPCFrontend* frontend_;
 
   // Reset whenever needed:
-  poly::StringBuffer comment_buffer_;
+  StringBuffer comment_buffer_;
 
   // Reset each Emit:
   bool with_debug_info_;

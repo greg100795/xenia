@@ -9,7 +9,10 @@
 
 #include "xenia/cpu/mmio_handler.h"
 
-#include "poly/poly.h"
+#include "xenia/base/assert.h"
+#include "xenia/base/byte_order.h"
+#include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 
 namespace BE {
 #include <beaengine/BeaEngine.h>
@@ -21,9 +24,11 @@ namespace cpu {
 MMIOHandler* MMIOHandler::global_handler_ = nullptr;
 
 // Implemented in the platform cc file.
-std::unique_ptr<MMIOHandler> CreateMMIOHandler(uint8_t* mapping_base);
+std::unique_ptr<MMIOHandler> CreateMMIOHandler(uint8_t* virtual_membase,
+                                               uint8_t* physical_membase);
 
-std::unique_ptr<MMIOHandler> MMIOHandler::Install(uint8_t* mapping_base) {
+std::unique_ptr<MMIOHandler> MMIOHandler::Install(uint8_t* virtual_membase,
+                                                  uint8_t* physical_membase) {
   // There can be only one handler at a time.
   assert_null(global_handler_);
   if (global_handler_) {
@@ -31,7 +36,7 @@ std::unique_ptr<MMIOHandler> MMIOHandler::Install(uint8_t* mapping_base) {
   }
 
   // Create the platform-specific handler.
-  auto handler = CreateMMIOHandler(mapping_base);
+  auto handler = CreateMMIOHandler(virtual_membase, physical_membase);
 
   // Platform-specific initialization for the handler.
   if (!handler->Initialize()) {
@@ -47,45 +52,61 @@ MMIOHandler::~MMIOHandler() {
   global_handler_ = nullptr;
 }
 
-bool MMIOHandler::RegisterRange(uint64_t address, uint64_t mask, uint64_t size,
-                                void* context, MMIOReadCallback read_callback,
+bool MMIOHandler::RegisterRange(uint32_t virtual_address, uint32_t mask,
+                                uint32_t size, void* context,
+                                MMIOReadCallback read_callback,
                                 MMIOWriteCallback write_callback) {
   mapped_ranges_.push_back({
-      reinterpret_cast<uint64_t>(mapping_base_) | address,
-      0xFFFFFFFF00000000ull | mask, size, context, read_callback,
-      write_callback,
+      virtual_address, mask, size, context, read_callback, write_callback,
   });
   return true;
 }
 
-bool MMIOHandler::CheckLoad(uint64_t address, uint64_t* out_value) {
+MMIORange* MMIOHandler::LookupRange(uint32_t virtual_address) {
+  for (auto& range : mapped_ranges_) {
+    if ((virtual_address & range.mask) == range.address) {
+      return &range;
+    }
+  }
+  return nullptr;
+}
+
+bool MMIOHandler::CheckLoad(uint32_t virtual_address, uint64_t* out_value) {
   for (const auto& range : mapped_ranges_) {
-    if (((address | (uint64_t)mapping_base_) & range.mask) == range.address) {
-      *out_value = static_cast<uint32_t>(range.read(range.context, address));
+    if ((virtual_address & range.mask) == range.address) {
+      *out_value = static_cast<uint32_t>(
+          range.read(nullptr, range.callback_context, virtual_address));
       return true;
     }
   }
   return false;
 }
 
-bool MMIOHandler::CheckStore(uint64_t address, uint64_t value) {
+bool MMIOHandler::CheckStore(uint32_t virtual_address, uint64_t value) {
   for (const auto& range : mapped_ranges_) {
-    if (((address | (uint64_t)mapping_base_) & range.mask) == range.address) {
-      range.write(range.context, address, value);
+    if ((virtual_address & range.mask) == range.address) {
+      range.write(nullptr, range.callback_context, virtual_address, value);
       return true;
     }
   }
   return false;
 }
 
-uintptr_t MMIOHandler::AddWriteWatch(uint32_t guest_address, size_t length,
-                                     WriteWatchCallback callback,
-                                     void* callback_context,
-                                     void* callback_data) {
+uintptr_t MMIOHandler::AddPhysicalWriteWatch(uint32_t guest_address,
+                                             size_t length,
+                                             WriteWatchCallback callback,
+                                             void* callback_context,
+                                             void* callback_data) {
   uint32_t base_address = guest_address;
-  if (base_address > 0xA0000000) {
-    base_address -= 0xA0000000;
-  }
+  assert_true(base_address < 0x1FFFFFFF);
+
+  // Can only protect sizes matching system page size.
+  // This means we need to round up, which will cause spurious access
+  // violations and invalidations.
+  // TODO(benvanik): only invalidate if actually within the region?
+  length = xe::round_up(length + (base_address % xe::memory::page_size()),
+                        xe::memory::page_size());
+  base_address = base_address - (base_address % xe::memory::page_size());
 
   // Add to table. The slot reservation may evict a previous watch, which
   // could include our target, so we do it first.
@@ -100,29 +121,33 @@ uintptr_t MMIOHandler::AddWriteWatch(uint32_t guest_address, size_t length,
   write_watch_mutex_.unlock();
 
   // Make the desired range read only under all address spaces.
-  auto host_address = mapping_base_ + base_address;
-  DWORD old_protect;
-  VirtualProtect(host_address, length, PAGE_READONLY, &old_protect);
-  VirtualProtect(host_address + 0xA0000000, length, PAGE_READONLY,
-                 &old_protect);
-  VirtualProtect(host_address + 0xC0000000, length, PAGE_READONLY,
-                 &old_protect);
-  VirtualProtect(host_address + 0xE0000000, length, PAGE_READONLY,
-                 &old_protect);
+  xe::memory::Protect(physical_membase_ + entry->address, entry->length,
+                      xe::memory::PageAccess::kReadOnly, nullptr);
+  xe::memory::Protect(virtual_membase_ + 0xA0000000 + entry->address,
+                      entry->length, xe::memory::PageAccess::kReadOnly,
+                      nullptr);
+  xe::memory::Protect(virtual_membase_ + 0xC0000000 + entry->address,
+                      entry->length, xe::memory::PageAccess::kReadOnly,
+                      nullptr);
+  xe::memory::Protect(virtual_membase_ + 0xE0000000 + entry->address,
+                      entry->length, xe::memory::PageAccess::kReadOnly,
+                      nullptr);
 
   return reinterpret_cast<uintptr_t>(entry);
 }
 
 void MMIOHandler::ClearWriteWatch(WriteWatchEntry* entry) {
-  auto host_address = mapping_base_ + entry->address;
-  DWORD old_protect;
-  VirtualProtect(host_address, entry->length, PAGE_READWRITE, &old_protect);
-  VirtualProtect(host_address + 0xA0000000, entry->length, PAGE_READWRITE,
-                 &old_protect);
-  VirtualProtect(host_address + 0xC0000000, entry->length, PAGE_READWRITE,
-                 &old_protect);
-  VirtualProtect(host_address + 0xE0000000, entry->length, PAGE_READWRITE,
-                 &old_protect);
+  xe::memory::Protect(physical_membase_ + entry->address, entry->length,
+                      xe::memory::PageAccess::kReadWrite, nullptr);
+  xe::memory::Protect(virtual_membase_ + 0xA0000000 + entry->address,
+                      entry->length, xe::memory::PageAccess::kReadWrite,
+                      nullptr);
+  xe::memory::Protect(virtual_membase_ + 0xC0000000 + entry->address,
+                      entry->length, xe::memory::PageAccess::kReadWrite,
+                      nullptr);
+  xe::memory::Protect(virtual_membase_ + 0xE0000000 + entry->address,
+                      entry->length, xe::memory::PageAccess::kReadWrite,
+                      nullptr);
 }
 
 void MMIOHandler::CancelWriteWatch(uintptr_t watch_handle) {
@@ -143,17 +168,16 @@ void MMIOHandler::CancelWriteWatch(uintptr_t watch_handle) {
 }
 
 bool MMIOHandler::CheckWriteWatch(void* thread_state, uint64_t fault_address) {
-  uint32_t guest_address = uint32_t(fault_address - uintptr_t(mapping_base_));
-  uint32_t base_address = guest_address;
-  if (base_address > 0xA0000000) {
-    base_address -= 0xA0000000;
+  uint32_t physical_address = uint32_t(fault_address);
+  if (physical_address > 0x1FFFFFFF) {
+    physical_address &= 0x1FFFFFFF;
   }
   std::list<WriteWatchEntry*> pending_invalidates;
   write_watch_mutex_.lock();
   for (auto it = write_watches_.begin(); it != write_watches_.end();) {
     auto entry = *it;
-    if (entry->address <= base_address &&
-        entry->address + entry->length > base_address) {
+    if (entry->address <= physical_address &&
+        entry->address + entry->length > physical_address) {
       // Hit!
       pending_invalidates.push_back(entry);
       // TODO(benvanik): outside of lock?
@@ -174,7 +198,7 @@ bool MMIOHandler::CheckWriteWatch(void* thread_state, uint64_t fault_address) {
     auto entry = pending_invalidates.back();
     pending_invalidates.pop_back();
     entry->callback(entry->callback_context, entry->callback_data,
-                    guest_address);
+                    physical_address);
     delete entry;
   }
   // Range was watched, so lets eat this access violation.
@@ -183,13 +207,21 @@ bool MMIOHandler::CheckWriteWatch(void* thread_state, uint64_t fault_address) {
 
 bool MMIOHandler::HandleAccessFault(void* thread_state,
                                     uint64_t fault_address) {
+  if (fault_address < uint64_t(virtual_membase_)) {
+    // Quick kill anything below our mapping base.
+    return false;
+  }
+
   // Access violations are pretty rare, so we can do a linear search here.
+  // Only check if in the virtual range, as we only support virtual ranges.
   const MMIORange* range = nullptr;
-  for (const auto& test_range : mapped_ranges_) {
-    if ((fault_address & test_range.mask) == test_range.address) {
-      // Address is within the range of this mapping.
-      range = &test_range;
-      break;
+  if (fault_address < uint64_t(physical_membase_)) {
+    for (const auto& test_range : mapped_ranges_) {
+      if ((uint32_t(fault_address) & test_range.mask) == test_range.address) {
+        // Address is within the range of this mapping.
+        range = &test_range;
+        break;
+      }
     }
   }
   if (!range) {
@@ -226,9 +258,10 @@ bool MMIOHandler::HandleAccessFault(void* thread_state,
   if (is_load) {
     // Load of a memory value - read from range, swap, and store in the
     // register.
-    uint64_t value = range->read(range->context, fault_address & 0xFFFFFFFF);
+    uint64_t value = range->read(nullptr, range->callback_context,
+                                 fault_address & 0xFFFFFFFF);
     uint32_t be_reg_index;
-    if (!poly::bit_scan_forward(arg1_type & 0xFFFF, &be_reg_index)) {
+    if (!xe::bit_scan_forward(arg1_type & 0xFFFF, &be_reg_index)) {
       be_reg_index = 0;
     }
     uint64_t* reg_ptr = GetThreadStateRegPtr(thread_state, be_reg_index);
@@ -237,21 +270,21 @@ bool MMIOHandler::HandleAccessFault(void* thread_state,
         *reg_ptr = static_cast<uint8_t>(value);
         break;
       case 16:
-        *reg_ptr = poly::byte_swap(static_cast<uint16_t>(value));
+        *reg_ptr = xe::byte_swap(static_cast<uint16_t>(value));
         break;
       case 32:
-        *reg_ptr = poly::byte_swap(static_cast<uint32_t>(value));
+        *reg_ptr = xe::byte_swap(static_cast<uint32_t>(value));
         break;
       case 64:
-        *reg_ptr = poly::byte_swap(static_cast<uint64_t>(value));
+        *reg_ptr = xe::byte_swap(static_cast<uint64_t>(value));
         break;
     }
   } else if (is_store) {
     // Store of a register value - read register, swap, write to range.
-    uint64_t value;
+    uint64_t value = 0;
     if ((arg2_type & BE::REGISTER_TYPE) == BE::REGISTER_TYPE) {
       uint32_t be_reg_index;
-      if (!poly::bit_scan_forward(arg2_type & 0xFFFF, &be_reg_index)) {
+      if (!xe::bit_scan_forward(arg2_type & 0xFFFF, &be_reg_index)) {
         be_reg_index = 0;
       }
       uint64_t* reg_ptr = GetThreadStateRegPtr(thread_state, be_reg_index);
@@ -267,16 +300,17 @@ bool MMIOHandler::HandleAccessFault(void* thread_state,
         value = static_cast<uint8_t>(value);
         break;
       case 16:
-        value = poly::byte_swap(static_cast<uint16_t>(value));
+        value = xe::byte_swap(static_cast<uint16_t>(value));
         break;
       case 32:
-        value = poly::byte_swap(static_cast<uint32_t>(value));
+        value = xe::byte_swap(static_cast<uint32_t>(value));
         break;
       case 64:
-        value = poly::byte_swap(static_cast<uint64_t>(value));
+        value = xe::byte_swap(static_cast<uint64_t>(value));
         break;
     }
-    range->write(range->context, fault_address & 0xFFFFFFFF, value);
+    range->write(nullptr, range->callback_context, fault_address & 0xFFFFFFFF,
+                 value);
   } else {
     assert_always("Unknown MMIO instruction type");
     return false;

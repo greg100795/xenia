@@ -10,26 +10,25 @@
 #ifndef XENIA_APU_XAUDIO2_XAUDIO2_AUDIO_SYSTEM_H_
 #define XENIA_APU_XAUDIO2_XAUDIO2_AUDIO_SYSTEM_H_
 
-#include <xaudio2.h>
-
-#include "xenia/common.h"
 #include "xenia/apu/audio_system.h"
-#include "xenia/apu/xaudio2/xaudio2_apu-private.h"
 
 namespace xe {
 namespace apu {
 namespace xaudio2 {
 
 class XAudio2AudioSystem : public AudioSystem {
-public:
+ public:
   XAudio2AudioSystem(Emulator* emulator);
-  virtual ~XAudio2AudioSystem();
+  ~XAudio2AudioSystem() override;
 
-  virtual X_RESULT CreateDriver(size_t index, HANDLE wait, AudioDriver** out_driver);
-  virtual void DestroyDriver(AudioDriver* driver);
+  static std::unique_ptr<AudioSystem> Create(Emulator* emulator);
 
-protected:
-  virtual void Initialize();
+  X_RESULT CreateDriver(size_t index, xe::threading::Semaphore* semaphore,
+                        AudioDriver** out_driver) override;
+  void DestroyDriver(AudioDriver* driver) override;
+
+ protected:
+  void Initialize() override;
 };
 
 }  // namespace xaudio2

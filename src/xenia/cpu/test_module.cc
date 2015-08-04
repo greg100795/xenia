@@ -9,11 +9,12 @@
 
 #include "xenia/cpu/test_module.h"
 
+#include "xenia/base/assert.h"
+#include "xenia/base/platform.h"
+#include "xenia/base/reset_scope.h"
+#include "xenia/base/string.h"
 #include "xenia/cpu/compiler/compiler_passes.h"
-#include "xenia/cpu/runtime.h"
-#include "poly/platform.h"
-#include "poly/reset_scope.h"
-#include "poly/string.h"
+#include "xenia/cpu/processor.h"
 
 namespace xe {
 namespace cpu {
@@ -23,16 +24,16 @@ using xe::cpu::compiler::Compiler;
 using xe::cpu::hir::HIRBuilder;
 namespace passes = xe::cpu::compiler::passes;
 
-TestModule::TestModule(Runtime* runtime, const std::string& name,
+TestModule::TestModule(Processor* processor, const std::string& name,
                        std::function<bool(uint32_t)> contains_address,
                        std::function<bool(hir::HIRBuilder&)> generate)
-    : Module(runtime),
+    : Module(processor),
       name_(name),
       contains_address_(contains_address),
       generate_(generate) {
   builder_.reset(new HIRBuilder());
-  compiler_.reset(new Compiler(runtime));
-  assembler_ = std::move(runtime->backend()->CreateAssembler());
+  compiler_.reset(new Compiler(processor));
+  assembler_ = processor->backend()->CreateAssembler();
   assembler_->Initialize();
 
   // Merge blocks early. This will let us use more context in other passes.
@@ -58,7 +59,7 @@ TestModule::TestModule(Runtime* runtime, const std::string& name,
   // This should be the last pass before finalization, as after this all
   // registers are assigned and ready to be emitted.
   compiler_->AddPass(std::make_unique<passes::RegisterAllocationPass>(
-      runtime->backend()->machine_info()));
+      processor->backend()->machine_info()));
 
   // Must come last. The HIR is not really HIR after this.
   compiler_->AddPass(std::make_unique<passes::FinalizationPass>());
@@ -70,28 +71,28 @@ bool TestModule::ContainsAddress(uint32_t address) {
   return contains_address_(address);
 }
 
-SymbolInfo::Status TestModule::DeclareFunction(uint32_t address,
-                                               FunctionInfo** out_symbol_info) {
-  SymbolInfo::Status status = Module::DeclareFunction(address, out_symbol_info);
-  if (status == SymbolInfo::STATUS_NEW) {
+SymbolStatus TestModule::DeclareFunction(uint32_t address,
+                                         FunctionInfo** out_symbol_info) {
+  SymbolStatus status = Module::DeclareFunction(address, out_symbol_info);
+  if (status == SymbolStatus::kNew) {
     auto symbol_info = *out_symbol_info;
 
     // Reset() all caching when we leave.
-    poly::make_reset_scope(compiler_);
-    poly::make_reset_scope(assembler_);
+    xe::make_reset_scope(compiler_);
+    xe::make_reset_scope(assembler_);
 
     if (!generate_(*builder_.get())) {
-      symbol_info->set_status(SymbolInfo::STATUS_FAILED);
-      return SymbolInfo::STATUS_FAILED;
+      symbol_info->set_status(SymbolStatus::kFailed);
+      return SymbolStatus::kFailed;
     }
 
     compiler_->Compile(builder_.get());
 
     Function* fn = nullptr;
-    assembler_->Assemble(symbol_info, builder_.get(), 0, nullptr, 0, &fn);
+    assembler_->Assemble(symbol_info, builder_.get(), 0, nullptr, &fn);
 
     symbol_info->set_function(fn);
-    status = SymbolInfo::STATUS_DEFINED;
+    status = SymbolStatus::kDefined;
     symbol_info->set_status(status);
   }
   return status;

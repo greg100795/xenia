@@ -13,15 +13,16 @@
 #include <memory>
 #include <mutex>
 
-#include "poly/type_pool.h"
+#include "xenia/base/mutex.h"
+#include "xenia/base/type_pool.h"
 #include "xenia/cpu/frontend/context_info.h"
-#include "xenia/memory.h"
 #include "xenia/cpu/function.h"
 #include "xenia/cpu/symbol_info.h"
+#include "xenia/memory.h"
 
 namespace xe {
 namespace cpu {
-class Runtime;
+class Processor;
 }  // namespace cpu
 }  // namespace xe
 
@@ -32,7 +33,7 @@ namespace frontend {
 class PPCTranslator;
 
 struct PPCBuiltins {
-  std::mutex global_lock;
+  xe::mutex global_lock;
   bool global_lock_taken;
   FunctionInfo* check_global_lock;
   FunctionInfo* handle_global_lock;
@@ -40,25 +41,25 @@ struct PPCBuiltins {
 
 class PPCFrontend {
  public:
-  explicit PPCFrontend(Runtime* runtime);
+  explicit PPCFrontend(Processor* processor);
   ~PPCFrontend();
 
-  int Initialize();
+  bool Initialize();
 
-  Runtime* runtime() const { return runtime_; }
+  Processor* processor() const { return processor_; }
   Memory* memory() const;
   ContextInfo* context_info() const { return context_info_.get(); }
   PPCBuiltins* builtins() { return &builtins_; }
 
-  int DeclareFunction(FunctionInfo* symbol_info);
-  int DefineFunction(FunctionInfo* symbol_info, uint32_t debug_info_flags,
-                     uint32_t trace_flags, Function** out_function);
+  bool DeclareFunction(FunctionInfo* symbol_info);
+  bool DefineFunction(FunctionInfo* symbol_info, uint32_t debug_info_flags,
+                      Function** out_function);
 
  private:
-  Runtime* runtime_;
+  Processor* processor_;
   std::unique_ptr<ContextInfo> context_info_;
   PPCBuiltins builtins_;
-  poly::TypePool<PPCTranslator, PPCFrontend*> translator_pool_;
+  TypePool<PPCTranslator, PPCFrontend*> translator_pool_;
 };
 
 }  // namespace frontend

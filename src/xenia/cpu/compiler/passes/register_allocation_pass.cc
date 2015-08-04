@@ -10,7 +10,11 @@
 #include "xenia/cpu/compiler/passes/register_allocation_pass.h"
 
 #include <algorithm>
+#include <cstring>
 
+#include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/profiling.h"
 
 namespace xe {
@@ -36,7 +40,7 @@ RegisterAllocationPass::RegisterAllocationPass(const MachineInfo* machine_info)
   // Initialize register sets.
   // TODO(benvanik): rewrite in a way that makes sense - this is terrible.
   auto mi_sets = machine_info->register_sets;
-  memset(&usage_sets_, 0, sizeof(usage_sets_));
+  std::memset(&usage_sets_, 0, sizeof(usage_sets_));
   uint32_t n = 0;
   while (mi_sets[n].count) {
     auto& mi_set = mi_sets[n];
@@ -58,7 +62,7 @@ RegisterAllocationPass::RegisterAllocationPass(const MachineInfo* machine_info)
 }
 
 RegisterAllocationPass::~RegisterAllocationPass() {
-  for (size_t n = 0; n < poly::countof(usage_sets_.all_sets); n++) {
+  for (size_t n = 0; n < xe::countof(usage_sets_.all_sets); n++) {
     if (!usage_sets_.all_sets[n]) {
       break;
     }
@@ -66,14 +70,14 @@ RegisterAllocationPass::~RegisterAllocationPass() {
   }
 }
 
-int RegisterAllocationPass::Run(HIRBuilder* builder) {
+bool RegisterAllocationPass::Run(HIRBuilder* builder) {
   // Simple per-block allocator that operates on SSA form.
   // Registers do not move across blocks, though this could be
   // optimized with some intra-block analysis (dominators/etc).
   // Really, it'd just be nice to have someone who knew what they
   // were doing lower SSA and do this right.
 
-  uint32_t block_ordinal = 0;
+  uint16_t block_ordinal = 0;
   uint32_t instr_ordinal = 0;
   auto block = builder->first_block();
   while (block) {
@@ -146,17 +150,17 @@ int RegisterAllocationPass::Run(HIRBuilder* builder) {
           // We spill only those registers we aren't using.
           if (!SpillOneRegister(builder, block, instr->dest->type)) {
             // Unable to spill anything - this shouldn't happen.
-            PLOGE("Unable to spill any registers");
+            XELOGE("Unable to spill any registers");
             assert_always();
-            return 1;
+            return false;
           }
 
           // Demand allocation.
           if (!TryAllocateRegister(instr->dest)) {
             // Boned.
-            PLOGE("Register allocation failed");
+            XELOGE("Register allocation failed");
             assert_always();
-            return 1;
+            return false;
           }
         }
       }
@@ -166,13 +170,13 @@ int RegisterAllocationPass::Run(HIRBuilder* builder) {
     block = block->next;
   }
 
-  return 0;
+  return true;
 }
 
 void RegisterAllocationPass::DumpUsage(const char* name) {
 #if 0
   fprintf(stdout, "\n%s:\n", name);
-  for (size_t i = 0; i < poly::countof(usage_sets_.all_sets); ++i) {
+  for (size_t i = 0; i < xe::countof(usage_sets_.all_sets); ++i) {
     auto usage_set = usage_sets_.all_sets[i];
     if (usage_set) {
       fprintf(stdout, "set %s:\n", usage_set->set->name);
@@ -191,7 +195,7 @@ void RegisterAllocationPass::DumpUsage(const char* name) {
 }
 
 void RegisterAllocationPass::PrepareBlockState() {
-  for (size_t i = 0; i < poly::countof(usage_sets_.all_sets); ++i) {
+  for (size_t i = 0; i < xe::countof(usage_sets_.all_sets); ++i) {
     auto usage_set = usage_sets_.all_sets[i];
     if (usage_set) {
       usage_set->availability.set();
@@ -202,45 +206,51 @@ void RegisterAllocationPass::PrepareBlockState() {
 }
 
 void RegisterAllocationPass::AdvanceUses(Instr* instr) {
-  for (size_t i = 0; i < poly::countof(usage_sets_.all_sets); ++i) {
+  for (size_t i = 0; i < xe::countof(usage_sets_.all_sets); ++i) {
     auto usage_set = usage_sets_.all_sets[i];
     if (!usage_set) {
       break;
     }
     auto& upcoming_uses = usage_set->upcoming_uses;
-    for (auto it = upcoming_uses.begin(); it != upcoming_uses.end();) {
-      if (!it->use) {
+    for (size_t j = 0; j < upcoming_uses.size();) {
+      auto& upcoming_use = upcoming_uses.at(j);
+      if (!upcoming_use.use) {
         // No uses at all - we can remove right away.
         // This comes up from instructions where the dest is never used,
         // like the ATOMIC ops.
-        MarkRegAvailable(it->value->reg);
-        it = upcoming_uses.erase(it);
+        MarkRegAvailable(upcoming_use.value->reg);
+        upcoming_uses.erase(upcoming_uses.begin() + j);
+        // i remains the same.
         continue;
       }
-      if (it->use->instr != instr) {
+      if (upcoming_use.use->instr != instr) {
         // Not yet at this instruction.
-        ++it;
+        ++j;
         continue;
       }
       // The use is from this instruction.
-      if (!it->use->next) {
+      if (!upcoming_use.use->next) {
         // Last use of the value. We can retire it now.
-        MarkRegAvailable(it->value->reg);
-        it = upcoming_uses.erase(it);
+        MarkRegAvailable(upcoming_use.value->reg);
+        upcoming_uses.erase(upcoming_uses.begin() + j);
+        // i remains the same.
+        continue;
       } else {
         // Used again. Push back the next use.
         // Note that we may be used multiple times this instruction, so
         // eat those.
-        auto next_use = it->use->next;
+        auto next_use = upcoming_use.use->next;
         while (next_use->next && next_use->instr == instr) {
           next_use = next_use->next;
         }
         // Remove the iterator.
-        auto value = it->value;
-        it = upcoming_uses.erase(it);
+        auto value = upcoming_use.value;
+        upcoming_uses.erase(upcoming_uses.begin() + j);
         assert_true(next_use->instr->block == instr->block);
         assert_true(value->def->block == instr->block);
         upcoming_uses.emplace_back(value, next_use);
+        // i remains the same.
+        continue;
       }
     }
   }
@@ -307,7 +317,7 @@ bool RegisterAllocationPass::TryAllocateRegister(Value* value) {
   // Find the first free register, if any.
   // We have to ensure it's a valid one (in our count).
   uint32_t first_unused = 0;
-  bool none_used = poly::bit_scan_forward(
+  bool none_used = xe::bit_scan_forward(
       static_cast<uint32_t>(usage_set->availability.to_ulong()), &first_unused);
   if (none_used && first_unused < usage_set->count) {
     // Available! Use it!

@@ -9,19 +9,20 @@
 
 #include "xenia/cpu/backend/backend.h"
 
+#include <cstring>
+
 namespace xe {
 namespace cpu {
 namespace backend {
 
-using xe::cpu::Runtime;
-
-Backend::Backend(Runtime* runtime) : runtime_(runtime) {
-  memset(&machine_info_, 0, sizeof(machine_info_));
+Backend::Backend(Processor* processor)
+    : processor_(processor), code_cache_(nullptr) {
+  std::memset(&machine_info_, 0, sizeof(machine_info_));
 }
 
 Backend::~Backend() = default;
 
-int Backend::Initialize() { return 0; }
+bool Backend::Initialize() { return true; }
 
 void* Backend::AllocThreadData() { return nullptr; }
 

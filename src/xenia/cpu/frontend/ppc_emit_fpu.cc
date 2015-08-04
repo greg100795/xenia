@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/frontend/ppc_emit-private.h"
 
+#include "xenia/base/assert.h"
 #include "xenia/cpu/frontend/ppc_context.h"
 #include "xenia/cpu/frontend/ppc_hir_builder.h"
 
@@ -115,9 +116,9 @@ XEEMITTER(fmulsx, 0xEC000032, A)(PPCHIRBuilder& f, InstrData& i) {
 
 XEEMITTER(fresx, 0xEC000030, A)(PPCHIRBuilder& f, InstrData& i) {
   // frD <- 1.0 / (frB)
-  Value* v = f.Convert(
-      f.Div(f.LoadConstant(1.0f), f.Convert(f.LoadFPR(i.A.FRB), FLOAT32_TYPE)),
-      FLOAT64_TYPE);
+  Value* v = f.Convert(f.Div(f.LoadConstantFloat32(1.0f),
+                             f.Convert(f.LoadFPR(i.A.FRB), FLOAT32_TYPE)),
+                       FLOAT64_TYPE);
   f.StoreFPR(i.A.FRT, v);
   // f.UpdateFPRF(v);
   if (i.A.Rc) {
@@ -129,8 +130,17 @@ XEEMITTER(fresx, 0xEC000030, A)(PPCHIRBuilder& f, InstrData& i) {
 }
 
 XEEMITTER(frsqrtex, 0xFC000034, A)(PPCHIRBuilder& f, InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // Double precision:
+  // frD <- 1/sqrt(frB)
+  Value* v = f.RSqrt(f.LoadFPR(i.A.FRB));
+  f.StoreFPR(i.A.FRT, v);
+  // f.UpdateFPRF(v);
+  if (i.A.Rc) {
+    // e.update_cr_with_cond(1, v);
+    XEINSTRNOTIMPLEMENTED();
+    return 1;
+  }
+  return 0;
 }
 
 XEEMITTER(fsubx, 0xFC000028, A)(PPCHIRBuilder& f, InstrData& i) {
@@ -164,7 +174,7 @@ XEEMITTER(fselx, 0xFC00002E, A)(PPCHIRBuilder& f, InstrData& i) {
   // if (frA) >= 0.0
   // then frD <- (frC)
   // else frD <- (frB)
-  Value* ge = f.CompareSGE(f.LoadFPR(i.A.FRA), f.LoadConstant(0.0));
+  Value* ge = f.CompareSGE(f.LoadFPR(i.A.FRA), f.LoadZeroFloat64());
   Value* v = f.Select(ge, f.LoadFPR(i.A.FRC), f.LoadFPR(i.A.FRB));
   f.StoreFPR(i.A.FRT, v);
   if (i.A.Rc) {
@@ -178,7 +188,7 @@ XEEMITTER(fselx, 0xFC00002E, A)(PPCHIRBuilder& f, InstrData& i) {
 XEEMITTER(fsqrtx, 0xFC00002C, A)(PPCHIRBuilder& f, InstrData& i) {
   // Double precision:
   // frD <- sqrt(frB)
-  Value* v = f.Sqrt(f.LoadFPR(i.A.FRA));
+  Value* v = f.Sqrt(f.LoadFPR(i.A.FRB));
   f.StoreFPR(i.A.FRT, v);
   // f.UpdateFPRF(v);
   if (i.A.Rc) {
@@ -192,7 +202,7 @@ XEEMITTER(fsqrtx, 0xFC00002C, A)(PPCHIRBuilder& f, InstrData& i) {
 XEEMITTER(fsqrtsx, 0xEC00002C, A)(PPCHIRBuilder& f, InstrData& i) {
   // Single precision:
   // frD <- sqrt(frB)
-  Value* v = f.Sqrt(f.LoadFPR(i.A.FRA));
+  Value* v = f.Sqrt(f.LoadFPR(i.A.FRB));
   v = f.Convert(f.Convert(v, FLOAT32_TYPE), FLOAT64_TYPE);
   f.StoreFPR(i.A.FRT, v);
   // f.UpdateFPRF(v);
@@ -465,8 +475,8 @@ XEEMITTER(mtfsfx, 0xFC00058E, XFL)(PPCHIRBuilder& f, InstrData& i) {
   } else {
     // Directly store.
     // TODO(benvanik): use w/field mask to select bits.
-    i.XFL.W;
-    i.XFL.FM;
+    // i.XFL.W;
+    // i.XFL.FM;
     f.StoreFPSCR(f.Cast(f.LoadFPR(i.XFL.RB), INT64_TYPE));
   }
   return 0;
@@ -504,8 +514,15 @@ XEEMITTER(fmrx, 0xFC000090, X)(PPCHIRBuilder& f, InstrData& i) {
 }
 
 XEEMITTER(fnabsx, 0xFC000110, X)(PPCHIRBuilder& f, InstrData& i) {
-  XEINSTRNOTIMPLEMENTED();
-  return 1;
+  // frD <- !abs(frB)
+  Value* v = f.Neg(f.Abs(f.LoadFPR(i.X.RB)));
+  f.StoreFPR(i.X.RT, v);
+  if (i.X.Rc) {
+    // e.update_cr_with_cond(1, v);
+    XEINSTRNOTIMPLEMENTED();
+    return 1;
+  }
+  return 0;
 }
 
 XEEMITTER(fnegx, 0xFC000050, X)(PPCHIRBuilder& f, InstrData& i) {

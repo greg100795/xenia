@@ -1,24 +1,24 @@
-[submodule "third_party/gflags"]
-	path = third_party/gflags
-	url = https://github.com/benvanik/gflags.git
-[submodule "third_party/sparsehash"]
-	path = third_party/sparsehash
-	url = https://github.com/benvanik/sparsehash.git
 [submodule "third_party/beaengine"]
 	path = third_party/beaengine
 	url = https://github.com/benvanik/beaengine.git
 [submodule "third_party/xbyak"]
 	path = third_party/xbyak
-	url = https://github.com/herumi/xbyak.git
-[submodule "third_party/gyp"]
-	path = third_party/gyp
-	url = https://chromium.googlesource.com/external/gyp
-[submodule "third_party/ninja"]
-	path = third_party/ninja
-	url = https://chromium.googlesource.com/external/martine/ninja
-[submodule "third_party/catch"]
-	path = third_party/catch
-	url = https://github.com/philsquared/Catch.git
+	url = https://github.com/xenia-project/xbyak.git
 [submodule "third_party/imgui"]
 	path = third_party/imgui
 	url = https://github.com/ocornut/imgui.git
+[submodule "third_party/binutils-ppc-cygwin"]
+	path = third_party/binutils-ppc-cygwin
+	url = https://github.com/benvanik/binutils-ppc-cygwin
+[submodule "third_party/capstone"]
+	path = third_party/capstone
+	url = https://github.com/xenia-project/capstone.git
+[submodule "third_party/libav-xma-bin"]
+	path = third_party/libav-xma-bin
+	url = https://github.com/xenia-project/libav-xma-bin.git
+[submodule "third_party/elemental-forms"]
+	path = third_party/elemental-forms
+	url = https://github.com/xenia-project/elemental-forms.git
+[submodule "build_tools"]
+	path = build_tools
+	url = https://github.com/xenia-project/build-tools.git

@@ -9,8 +9,10 @@
 
 #include "xenia/gpu/gl4/gl4_shader_translator.h"
 
-#include "poly/math.h"
-#include "xenia/gpu/gpu-private.h"
+#include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/gpu/gpu_flags.h"
 
 namespace xe {
 namespace gpu {
@@ -18,6 +20,8 @@ namespace gl4 {
 
 using namespace xe::gpu::ucode;
 using namespace xe::gpu::xenos;
+
+#define Append(...) output_.AppendFormat(__VA_ARGS__)
 
 static const char chan_names[] = {
     'x', 'y', 'z', 'w',
@@ -53,8 +57,7 @@ const char* GetVertexFormatTypeName(const GL4Shader::BufferDescElement& el) {
   }
 }
 
-GL4ShaderTranslator::GL4ShaderTranslator()
-    : output_(kOutputCapacity), dwords_(nullptr) {}
+GL4ShaderTranslator::GL4ShaderTranslator() : output_(kOutputCapacity) {}
 
 GL4ShaderTranslator::~GL4ShaderTranslator() = default;
 
@@ -91,8 +94,6 @@ std::string GL4ShaderTranslator::TranslateVertexShader(
     }
   }
 
-  const auto& alloc_counts = vertex_shader->alloc_counts();
-
   // Vertex shader main() header.
   Append("void processVertex(const in StateData state) {\n");
 
@@ -101,6 +102,17 @@ std::string GL4ShaderTranslator::TranslateVertexShader(
   for (uint32_t n = 0; n <= temp_regs; n++) {
     Append("  vec4 r%d = state.float_consts[%d];\n", n, n);
   }
+
+#if FLOW_CONTROL
+  // Add temporary integer registers for loops that we may use.
+  // Each loop uses an address, counter, and constant
+  // TODO: Implement only for the used loops in the shader
+  for (uint32_t n = 0; n < 32; n++) {
+    Append("  int i%d_cnt = 0;\n", n);
+    Append("  int i%d_addr = 0;\n", n);
+  }
+#endif
+
   Append("  vec4 t;\n");
   Append("  vec4 pv;\n");   // Previous Vector result.
   Append("  float ps;\n");  // Previous Scalar result (used for RETAIN_PREV).
@@ -193,8 +205,15 @@ void GL4ShaderTranslator::AppendSrcReg(const instr_alu_t& op, uint32_t num,
       Append("abs(");
     }
     Append("state.float_consts[");
+#if FLOW_CONTROL
+    // NOTE(dariosamo): Some games don't seem to take into account the relative
+    // a0
+    // offset even when they should due to const_slot being a different value.
+    if (op.const_0_rel_abs || op.const_1_rel_abs) {
+#else
     if ((const_slot == 0 && op.const_0_rel_abs) ||
         (const_slot == 1 && op.const_1_rel_abs)) {
+#endif
       if (op.relative_addr) {
         assert_true(num < 256);
         Append("a0 + %u", is_pixel_shader() ? num + 256 : num);
@@ -779,7 +798,7 @@ bool GL4ShaderTranslator::TranslateALU_ADDs(const instr_alu_t& alu) {
   AppendScalarOpSrcReg(alu, 3);
   Append(".x + ");
   AppendScalarOpSrcReg(alu, 3);
-  Append(".y");
+  Append(".z");
   EndAppendScalarOp(alu);
   return true;
 }
@@ -797,7 +816,7 @@ bool GL4ShaderTranslator::TranslateALU_MULs(const instr_alu_t& alu) {
   AppendScalarOpSrcReg(alu, 3);
   Append(".x * ");
   AppendScalarOpSrcReg(alu, 3);
-  Append(".y");
+  Append(".z");
   EndAppendScalarOp(alu);
   return true;
 }
@@ -1023,7 +1042,7 @@ bool GL4ShaderTranslator::TranslateALU_SUBs(const instr_alu_t& alu) {
   AppendScalarOpSrcReg(alu, 3);
   Append(".x - ");
   AppendScalarOpSrcReg(alu, 3);
-  Append(".y");
+  Append(".z");
   EndAppendScalarOp(alu);
   return true;
 }
@@ -1453,6 +1472,12 @@ bool GL4ShaderTranslator::TranslateBlocks(GL4Shader* shader) {
     } else if (cfa.opc == COND_JMP) {
       TranslateJmp(cfa.jmp_call);
     }
+#if FLOW_CONTROL
+    else if (cfa.opc == LOOP_START) {
+      TranslateLoopStart(cfa.loop);
+    }
+#endif  // FLOW_CONTROL
+
     if (cfb.opc == ALLOC) {
       // ?
     } else if (cfb.is_exec()) {
@@ -1467,6 +1492,12 @@ bool GL4ShaderTranslator::TranslateBlocks(GL4Shader* shader) {
     } else if (cfb.opc == COND_JMP) {
       TranslateJmp(cfb.jmp_call);
     }
+#if FLOW_CONTROL
+    else if (cfb.opc == LOOP_END) {
+      TranslateLoopEnd(cfb.loop);
+    }
+#endif
+
     if (cfa.opc == EXEC_END || cfb.opc == EXEC_END) {
       break;
     }
@@ -1495,15 +1526,22 @@ static const struct {
 } cf_instructions[] = {
 #define INSTR(opc, fxn) \
   { #opc }
-    INSTR(NOP, print_cf_nop), INSTR(EXEC, print_cf_exec),
-    INSTR(EXEC_END, print_cf_exec), INSTR(COND_EXEC, print_cf_exec),
-    INSTR(COND_EXEC_END, print_cf_exec), INSTR(COND_PRED_EXEC, print_cf_exec),
-    INSTR(COND_PRED_EXEC_END, print_cf_exec), INSTR(LOOP_START, print_cf_loop),
-    INSTR(LOOP_END, print_cf_loop), INSTR(COND_CALL, print_cf_jmp_call),
-    INSTR(RETURN, print_cf_jmp_call), INSTR(COND_JMP, print_cf_jmp_call),
-    INSTR(ALLOC, print_cf_alloc), INSTR(COND_EXEC_PRED_CLEAN, print_cf_exec),
-    INSTR(COND_EXEC_PRED_CLEAN_END, print_cf_exec),
-    INSTR(MARK_VS_FETCH_DONE, print_cf_nop),  // ??
+    INSTR(NOP, print_cf_nop),                        //
+    INSTR(EXEC, print_cf_exec),                      //
+    INSTR(EXEC_END, print_cf_exec),                  //
+    INSTR(COND_EXEC, print_cf_exec),                 //
+    INSTR(COND_EXEC_END, print_cf_exec),             //
+    INSTR(COND_PRED_EXEC, print_cf_exec),            //
+    INSTR(COND_PRED_EXEC_END, print_cf_exec),        //
+    INSTR(LOOP_START, print_cf_loop),                //
+    INSTR(LOOP_END, print_cf_loop),                  //
+    INSTR(COND_CALL, print_cf_jmp_call),             //
+    INSTR(RETURN, print_cf_jmp_call),                //
+    INSTR(COND_JMP, print_cf_jmp_call),              //
+    INSTR(ALLOC, print_cf_alloc),                    //
+    INSTR(COND_EXEC_PRED_CLEAN, print_cf_exec),      //
+    INSTR(COND_EXEC_PRED_CLEAN_END, print_cf_exec),  //
+    INSTR(MARK_VS_FETCH_DONE, print_cf_nop),         // ??
 #undef INSTR
 };
 
@@ -1643,6 +1681,27 @@ bool GL4ShaderTranslator::TranslateJmp(const ucode::instr_cf_jmp_call_t& cf) {
   return true;
 }
 
+bool GL4ShaderTranslator::TranslateLoopStart(const ucode::instr_cf_loop_t& cf) {
+  Append("  // %s", cf_instructions[cf.opc].name);
+  Append(" ADDR(0x%x) LOOP ID(%d)", cf.address, cf.loop_id);
+  if (cf.address_mode == ABSOLUTE_ADDR) {
+    Append(" ABSOLUTE_ADDR");
+  }
+  Append("\n");
+  Append(" i%d_addr = pc;\n", cf.loop_id);
+  Append(" i%d_cnt = 0;\n", cf.loop_id);
+  return true;
+}
+
+bool GL4ShaderTranslator::TranslateLoopEnd(const ucode::instr_cf_loop_t& cf) {
+  Append("  // %s", cf_instructions[cf.opc].name);
+  Append(" ADDR(0x%x) LOOP ID(%d)\n", cf.address, cf.loop_id);
+  Append(" i%d_cnt = i%d_cnt + 1;\n", cf.loop_id, cf.loop_id);
+  Append(" pc = (i%d_cnt < state.loop_consts[%d]) ? i%d_addr : pc;\n",
+         cf.loop_id, cf.loop_id, cf.loop_id);
+  return true;
+}
+
 bool GL4ShaderTranslator::TranslateVertexFetch(const instr_fetch_vtx_t* vtx,
                                                int sync) {
   static const struct {
@@ -1750,8 +1809,8 @@ bool GL4ShaderTranslator::TranslateVertexFetch(const instr_fetch_vtx_t* vtx,
   uint32_t fetch_slot = vtx->const_index * 3 + vtx->const_index_sel;
   // TODO(benvanik): detect xyzw = xyzw, etc.
   // TODO(benvanik): detect and set as rN = vec4(samp.xyz, 1.0); / etc
-  uint32_t component_count =
-      GetVertexFormatComponentCount(static_cast<VertexFormat>(vtx->format));
+  // uint32_t component_count =
+  //     GetVertexFormatComponentCount(static_cast<VertexFormat>(vtx->format));
   uint32_t dst_swiz = vtx->dst_swiz;
   for (int i = 0; i < 4; i++) {
     if ((dst_swiz & 0x7) == 4) {

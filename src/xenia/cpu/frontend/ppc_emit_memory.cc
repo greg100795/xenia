@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/frontend/ppc_emit-private.h"
 
+#include "xenia/base/assert.h"
 #include "xenia/cpu/frontend/ppc_context.h"
 #include "xenia/cpu/frontend/ppc_hir_builder.h"
 
@@ -57,7 +58,7 @@ Value* CalculateEA_i(PPCHIRBuilder& f, uint32_t ra, uint64_t imm) {
                             f.LoadConstant((int32_t)imm)),
                       INT64_TYPE);
 #else
-  return f.Add(f.LoadGPR(ra), f.LoadConstant(imm));
+  return f.Add(f.LoadGPR(ra), f.LoadConstantUint64(imm));
 #endif  // TRUNCATE_ADDRESSES
 }
 
@@ -72,9 +73,9 @@ Value* CalculateEA_0_i(PPCHIRBuilder& f, uint32_t ra, uint64_t imm) {
   }
 #else
   if (ra) {
-    return f.Add(f.LoadGPR(ra), f.LoadConstant(imm));
+    return f.Add(f.LoadGPR(ra), f.LoadConstantUint64(imm));
   } else {
-    return f.LoadConstant(imm);
+    return f.LoadConstantUint64(imm);
   }
 #endif  // TRUNCATE_ADDRESSES
 }
@@ -983,11 +984,23 @@ XEEMITTER(dcbtst, 0x7C0001EC, X)(PPCHIRBuilder& f, InstrData& i) {
 }
 
 XEEMITTER(dcbz, 0x7C0007EC, X)(PPCHIRBuilder& f, InstrData& i) {
-  // No-op for now.
-  // TODO(benvanik): use prefetch
   // or dcbz128 0x7C2007EC
-  // XEINSTRNOTIMPLEMENTED();
-  f.Nop();
+  // EA <- (RA) + (RB)
+  // memset(EA & ~31, 0, 32)
+  Value* ea = CalculateEA_0(f, i.X.RA, i.X.RB);
+  int block_size;
+  int address_mask;
+  if (i.X.RT == 1) {
+    // dcbz128 - 128 byte set
+    block_size = 128;
+    address_mask = ~127;
+  } else {
+    // dcbz - 32 byte set
+    block_size = 32;
+    address_mask = ~31;
+  }
+  f.Memset(f.And(ea, f.LoadConstantInt64(address_mask)), f.LoadZeroInt8(),
+           f.LoadConstantInt64(block_size));
   return 0;
 }
 

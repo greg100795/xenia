@@ -12,12 +12,12 @@
 
 #include <memory>
 
-#include "poly/string.h"
+#include "xenia/base/string.h"
 
 #define XE_OPTION_PROFILING 1
-#if XE_LIKE_WIN32
+#if XE_PLATFORM_WIN32
 #define XE_OPTION_PROFILING_UI 1
-#endif  // XE_LIKE_WIN32
+#endif  // XE_PLATFORM_WIN32
 
 #if XE_OPTION_PROFILING
 // Pollutes the global namespace. Yuck.
@@ -148,11 +148,8 @@ class ProfilerDisplay {
 
 class Profiler {
  public:
-#if XE_OPTION_PROFILING
-  static bool is_enabled() { return true; }
-#else
-  static bool is_enabled() { return false; }
-#endif  // XE_OPTION_PROFILING
+  static bool is_enabled();
+  static bool is_visible();
 
   // Initializes the profiler. Call at startup.
   static void Initialize();
@@ -176,6 +173,8 @@ class Profiler {
   static void OnMouseUp();
   static void OnMouseMove(int x, int y);
   static void OnMouseWheel(int x, int y, int dy);
+  static void ToggleDisplay();
+  static void TogglePause();
 
   // Gets the current display, if any.
   static ProfilerDisplay* display() { return display_.get(); }
@@ -183,8 +182,6 @@ class Profiler {
   static void set_display(std::unique_ptr<ProfilerDisplay> display);
   // Presents the profiler to the bound display, if any.
   static void Present();
-
-  // TODO(benvanik): display mode/pause/etc?
 
  private:
   static std::unique_ptr<ProfilerDisplay> display_;

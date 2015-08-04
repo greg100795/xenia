@@ -10,29 +10,35 @@
 #ifndef XENIA_KERNEL_XBOXKRNL_XEVENT_H_
 #define XENIA_KERNEL_XBOXKRNL_XEVENT_H_
 
+#include "xenia/base/threading.h"
 #include "xenia/kernel/xobject.h"
 #include "xenia/xbox.h"
 
 namespace xe {
 namespace kernel {
 
+// http://www.nirsoft.net/kernel_struct/vista/KEVENT.html
+struct X_KEVENT {
+  X_DISPATCH_HEADER header;
+};
+
 class XEvent : public XObject {
  public:
   XEvent(KernelState* kernel_state);
-  virtual ~XEvent();
+  ~XEvent() override;
 
   void Initialize(bool manual_reset, bool initial_state);
-  void InitializeNative(void* native_ptr, DISPATCH_HEADER& header);
+  void InitializeNative(void* native_ptr, X_DISPATCH_HEADER& header);
 
   int32_t Set(uint32_t priority_increment, bool wait);
   int32_t Pulse(uint32_t priority_increment, bool wait);
   int32_t Reset();
   void Clear();
 
-  virtual void* GetWaitHandle() { return handle_; }
+  xe::threading::WaitHandle* GetWaitHandle() override { return event_.get(); }
 
  private:
-  HANDLE handle_;
+  std::unique_ptr<xe::threading::Event> event_;
 };
 
 }  // namespace kernel

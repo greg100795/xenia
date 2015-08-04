@@ -11,11 +11,15 @@
 
 #include <cmath>
 
+#include "xenia/base/assert.h"
+#include "xenia/base/byte_order.h"
+#include "xenia/base/math.h"
+
 namespace xe {
 namespace cpu {
 namespace hir {
 
-Value::Use* Value::AddUse(poly::Arena* arena, Instr* instr) {
+Value::Use* Value::AddUse(Arena* arena, Instr* instr) {
   Use* use = arena->Alloc<Use>();
   use->instr = instr;
   use->prev = NULL;
@@ -240,24 +244,28 @@ bool Value::Add(Value* other) {
 }
 
 bool Value::Sub(Value* other) {
-#define SUB_DID_CARRY(a, b) (b > a)
+#define SUB_DID_CARRY(a, b) (b == 0 || a > (~(0 - b)))
   assert_true(type == other->type);
   bool did_carry = false;
   switch (type) {
     case INT8_TYPE:
-      did_carry = SUB_DID_CARRY(constant.i8, other->constant.i8);
+      did_carry =
+          SUB_DID_CARRY(uint16_t(constant.i8), uint16_t(other->constant.i8));
       constant.i8 -= other->constant.i8;
       break;
     case INT16_TYPE:
-      did_carry = SUB_DID_CARRY(constant.i16, other->constant.i16);
+      did_carry =
+          SUB_DID_CARRY(uint16_t(constant.i16), uint16_t(other->constant.i16));
       constant.i16 -= other->constant.i16;
       break;
     case INT32_TYPE:
-      did_carry = SUB_DID_CARRY(constant.i32, other->constant.i32);
+      did_carry =
+          SUB_DID_CARRY(uint32_t(constant.i32), uint32_t(other->constant.i32));
       constant.i32 -= other->constant.i32;
       break;
     case INT64_TYPE:
-      did_carry = SUB_DID_CARRY(constant.i64, other->constant.i64);
+      did_carry =
+          SUB_DID_CARRY(uint64_t(constant.i64), uint64_t(other->constant.i64));
       constant.i64 -= other->constant.i64;
       break;
     case FLOAT32_TYPE:
@@ -300,20 +308,62 @@ void Value::Mul(Value* other) {
   }
 }
 
-void Value::Div(Value* other) {
+void Value::MulHi(Value* other, bool is_unsigned) {
+  assert_true(type == other->type);
+  switch (type) {
+    case INT32_TYPE:
+      if (is_unsigned) {
+        constant.i32 = (int32_t)(((uint64_t)((uint32_t)constant.i32) *
+                                  (uint32_t)other->constant.i32) >>
+                                 32);
+      } else {
+        constant.i32 = (int32_t)(
+            ((int64_t)constant.i32 * (int64_t)other->constant.i32) >> 32);
+      }
+      break;
+    case INT64_TYPE:
+      if (is_unsigned) {
+        constant.i64 = __umulh(constant.i64, other->constant.i64);
+      } else {
+        constant.i64 = __mulh(constant.i64, other->constant.i64);
+      }
+      break;
+    default:
+      assert_unhandled_case(type);
+      break;
+  }
+}
+
+void Value::Div(Value* other, bool is_unsigned) {
   assert_true(type == other->type);
   switch (type) {
     case INT8_TYPE:
-      constant.i8 /= other->constant.i8;
+      if (is_unsigned) {
+        constant.i8 /= uint8_t(other->constant.i8);
+      } else {
+        constant.i8 /= other->constant.i8;
+      }
       break;
     case INT16_TYPE:
-      constant.i16 /= other->constant.i16;
+      if (is_unsigned) {
+        constant.i16 /= uint16_t(other->constant.i16);
+      } else {
+        constant.i16 /= other->constant.i16;
+      }
       break;
     case INT32_TYPE:
-      constant.i32 /= other->constant.i32;
+      if (is_unsigned) {
+        constant.i32 /= uint32_t(other->constant.i32);
+      } else {
+        constant.i32 /= other->constant.i32;
+      }
       break;
     case INT64_TYPE:
-      constant.i64 /= other->constant.i64;
+      if (is_unsigned) {
+        constant.i64 /= uint64_t(other->constant.i64);
+      } else {
+        constant.i64 /= other->constant.i64;
+      }
       break;
     case FLOAT32_TYPE:
       constant.f32 /= other->constant.f32;
@@ -371,22 +421,22 @@ void Value::Neg() {
 void Value::Abs() {
   switch (type) {
     case INT8_TYPE:
-      constant.i8 = abs(constant.i8);
+      constant.i8 = int8_t(std::abs(constant.i8));
       break;
     case INT16_TYPE:
-      constant.i16 = abs(constant.i16);
+      constant.i16 = int16_t(std::abs(constant.i16));
       break;
     case INT32_TYPE:
-      constant.i32 = abs(constant.i32);
+      constant.i32 = std::abs(constant.i32);
       break;
     case INT64_TYPE:
-      constant.i64 = abs(constant.i64);
+      constant.i64 = std::abs(constant.i64);
       break;
     case FLOAT32_TYPE:
-      constant.f32 = abs(constant.f32);
+      constant.f32 = std::abs(constant.f32);
       break;
     case FLOAT64_TYPE:
-      constant.f64 = abs(constant.f64);
+      constant.f64 = std::abs(constant.f64);
       break;
     case VEC128_TYPE:
       for (int i = 0; i < 4; ++i) {
@@ -402,10 +452,10 @@ void Value::Abs() {
 void Value::Sqrt() {
   switch (type) {
     case FLOAT32_TYPE:
-      constant.f32 = 1.0f / sqrtf(constant.f32);
+      constant.f32 = 1.0f / std::sqrtf(constant.f32);
       break;
     case FLOAT64_TYPE:
-      constant.f64 = 1.0 / sqrt(constant.f64);
+      constant.f64 = 1.0 / std::sqrt(constant.f64);
       break;
     default:
       assert_unhandled_case(type);
@@ -416,10 +466,10 @@ void Value::Sqrt() {
 void Value::RSqrt() {
   switch (type) {
     case FLOAT32_TYPE:
-      constant.f32 = sqrt(constant.f32);
+      constant.f32 = std::sqrt(constant.f32);
       break;
     case FLOAT64_TYPE:
-      constant.f64 = sqrt(constant.f64);
+      constant.f64 = std::sqrt(constant.f64);
       break;
     default:
       assert_unhandled_case(type);
@@ -548,7 +598,7 @@ void Value::Shr(Value* other) {
       constant.i32 = (uint32_t)constant.i32 >> other->constant.i8;
       break;
     case INT64_TYPE:
-      constant.i64 = (uint16_t)constant.i64 >> other->constant.i8;
+      constant.i64 = (uint64_t)constant.i64 >> other->constant.i8;
       break;
     default:
       assert_unhandled_case(type);
@@ -583,17 +633,17 @@ void Value::ByteSwap() {
       constant.i8 = constant.i8;
       break;
     case INT16_TYPE:
-      constant.i16 = poly::byte_swap(constant.i16);
+      constant.i16 = xe::byte_swap(constant.i16);
       break;
     case INT32_TYPE:
-      constant.i32 = poly::byte_swap(constant.i32);
+      constant.i32 = xe::byte_swap(constant.i32);
       break;
     case INT64_TYPE:
-      constant.i64 = poly::byte_swap(constant.i64);
+      constant.i64 = xe::byte_swap(constant.i64);
       break;
     case VEC128_TYPE:
       for (int n = 0; n < 4; n++) {
-        constant.v128.u32[n] = poly::byte_swap(constant.v128.u32[n]);
+        constant.v128.u32[n] = xe::byte_swap(constant.v128.u32[n]);
       }
       break;
     default:
@@ -605,16 +655,16 @@ void Value::ByteSwap() {
 void Value::CountLeadingZeros(const Value* other) {
   switch (other->type) {
     case INT8_TYPE:
-      constant.i8 = poly::lzcnt(constant.i8);
+      constant.i8 = xe::lzcnt(other->constant.i8);
       break;
     case INT16_TYPE:
-      constant.i8 = poly::lzcnt(constant.i16);
+      constant.i8 = xe::lzcnt(other->constant.i16);
       break;
     case INT32_TYPE:
-      constant.i8 = poly::lzcnt(constant.i32);
+      constant.i8 = xe::lzcnt(other->constant.i32);
       break;
     case INT64_TYPE:
-      constant.i8 = poly::lzcnt(constant.i64);
+      constant.i8 = xe::lzcnt(other->constant.i64);
       break;
     default:
       assert_unhandled_case(type);
@@ -623,9 +673,132 @@ void Value::CountLeadingZeros(const Value* other) {
 }
 
 bool Value::Compare(Opcode opcode, Value* other) {
-  // TODO(benvanik): big matrix.
-  assert_always();
-  return false;
+  assert_true(type == other->type);
+  switch (other->type) {
+    case INT8_TYPE:
+      return CompareInt8(opcode, this, other);
+    case INT16_TYPE:
+      return CompareInt16(opcode, this, other);
+    case INT32_TYPE:
+      return CompareInt32(opcode, this, other);
+    case INT64_TYPE:
+      return CompareInt64(opcode, this, other);
+    default:
+      assert_unhandled_case(type);
+      return false;
+  }
+}
+
+bool Value::CompareInt8(Opcode opcode, Value* a, Value* b) {
+  switch (opcode) {
+    case OPCODE_COMPARE_EQ:
+      return a->constant.i8 == b->constant.i8;
+    case OPCODE_COMPARE_NE:
+      return a->constant.i8 != b->constant.i8;
+    case OPCODE_COMPARE_SLT:
+      return a->constant.i8 < b->constant.i8;
+    case OPCODE_COMPARE_SLE:
+      return a->constant.i8 <= b->constant.i8;
+    case OPCODE_COMPARE_SGT:
+      return a->constant.i8 > b->constant.i8;
+    case OPCODE_COMPARE_SGE:
+      return a->constant.i8 >= b->constant.i8;
+    case OPCODE_COMPARE_ULT:
+      return uint8_t(a->constant.i8) < uint8_t(b->constant.i8);
+    case OPCODE_COMPARE_ULE:
+      return uint8_t(a->constant.i8) <= uint8_t(b->constant.i8);
+    case OPCODE_COMPARE_UGT:
+      return uint8_t(a->constant.i8) > uint8_t(b->constant.i8);
+    case OPCODE_COMPARE_UGE:
+      return uint8_t(a->constant.i8) >= uint8_t(b->constant.i8);
+    default:
+      assert_unhandled_case(opcode);
+      return false;
+  }
+}
+
+bool Value::CompareInt16(Opcode opcode, Value* a, Value* b) {
+  switch (opcode) {
+    case OPCODE_COMPARE_EQ:
+      return a->constant.i16 == b->constant.i16;
+    case OPCODE_COMPARE_NE:
+      return a->constant.i16 != b->constant.i16;
+    case OPCODE_COMPARE_SLT:
+      return a->constant.i16 < b->constant.i16;
+    case OPCODE_COMPARE_SLE:
+      return a->constant.i16 <= b->constant.i16;
+    case OPCODE_COMPARE_SGT:
+      return a->constant.i16 > b->constant.i16;
+    case OPCODE_COMPARE_SGE:
+      return a->constant.i16 >= b->constant.i16;
+    case OPCODE_COMPARE_ULT:
+      return uint16_t(a->constant.i16) < uint16_t(b->constant.i16);
+    case OPCODE_COMPARE_ULE:
+      return uint16_t(a->constant.i16) <= uint16_t(b->constant.i16);
+    case OPCODE_COMPARE_UGT:
+      return uint16_t(a->constant.i16) > uint16_t(b->constant.i16);
+    case OPCODE_COMPARE_UGE:
+      return uint16_t(a->constant.i16) >= uint16_t(b->constant.i16);
+    default:
+      assert_unhandled_case(opcode);
+      return false;
+  }
+}
+
+bool Value::CompareInt32(Opcode opcode, Value* a, Value* b) {
+  switch (opcode) {
+    case OPCODE_COMPARE_EQ:
+      return a->constant.i32 == b->constant.i32;
+    case OPCODE_COMPARE_NE:
+      return a->constant.i32 != b->constant.i32;
+    case OPCODE_COMPARE_SLT:
+      return a->constant.i32 < b->constant.i32;
+    case OPCODE_COMPARE_SLE:
+      return a->constant.i32 <= b->constant.i32;
+    case OPCODE_COMPARE_SGT:
+      return a->constant.i32 > b->constant.i32;
+    case OPCODE_COMPARE_SGE:
+      return a->constant.i32 >= b->constant.i32;
+    case OPCODE_COMPARE_ULT:
+      return uint32_t(a->constant.i32) < uint32_t(b->constant.i32);
+    case OPCODE_COMPARE_ULE:
+      return uint32_t(a->constant.i32) <= uint32_t(b->constant.i32);
+    case OPCODE_COMPARE_UGT:
+      return uint32_t(a->constant.i32) > uint32_t(b->constant.i32);
+    case OPCODE_COMPARE_UGE:
+      return uint32_t(a->constant.i32) >= uint32_t(b->constant.i32);
+    default:
+      assert_unhandled_case(opcode);
+      return false;
+  }
+}
+
+bool Value::CompareInt64(Opcode opcode, Value* a, Value* b) {
+  switch (opcode) {
+    case OPCODE_COMPARE_EQ:
+      return a->constant.i64 == b->constant.i64;
+    case OPCODE_COMPARE_NE:
+      return a->constant.i64 != b->constant.i64;
+    case OPCODE_COMPARE_SLT:
+      return a->constant.i64 < b->constant.i64;
+    case OPCODE_COMPARE_SLE:
+      return a->constant.i64 <= b->constant.i64;
+    case OPCODE_COMPARE_SGT:
+      return a->constant.i64 > b->constant.i64;
+    case OPCODE_COMPARE_SGE:
+      return a->constant.i64 >= b->constant.i64;
+    case OPCODE_COMPARE_ULT:
+      return uint64_t(a->constant.i64) < uint64_t(b->constant.i64);
+    case OPCODE_COMPARE_ULE:
+      return uint64_t(a->constant.i64) <= uint64_t(b->constant.i64);
+    case OPCODE_COMPARE_UGT:
+      return uint64_t(a->constant.i64) > uint64_t(b->constant.i64);
+    case OPCODE_COMPARE_UGE:
+      return uint64_t(a->constant.i64) >= uint64_t(b->constant.i64);
+    default:
+      assert_unhandled_case(opcode);
+      return false;
+  }
 }
 
 }  // namespace hir

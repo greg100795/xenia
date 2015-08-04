@@ -9,42 +9,77 @@
 
 #include "xenia/cpu/thread_state.h"
 
-#include "xdb/protocol.h"
-#include "xenia/cpu/runtime.h"
+#include <cstring>
+
+#include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/threading.h"
+#include "xenia/cpu/processor.h"
+#include "xenia/debug/debugger.h"
+
+#include "xenia/xbox.h"
 
 namespace xe {
 namespace cpu {
-
-using namespace xe::cpu;
 
 using PPCContext = xe::cpu::frontend::PPCContext;
 
 thread_local ThreadState* thread_state_ = nullptr;
 
-ThreadState::ThreadState(Runtime* runtime, uint32_t thread_id,
-                         uint32_t stack_address, uint32_t stack_size,
-                         uint32_t thread_state_address)
-    : runtime_(runtime),
-      memory_(runtime->memory()),
+ThreadState::ThreadState(Processor* processor, uint32_t thread_id,
+                         ThreadStackType stack_type, uint32_t stack_address,
+                         uint32_t stack_size, uint32_t pcr_address)
+    : processor_(processor),
+      memory_(processor->memory()),
       thread_id_(thread_id),
+      stack_type_(stack_type),
       name_(""),
       backend_data_(0),
       stack_size_(stack_size),
-      thread_state_address_(thread_state_address) {
+      pcr_address_(pcr_address) {
   if (thread_id_ == UINT_MAX) {
     // System thread. Assign the system thread ID with a high bit
     // set so people know what's up.
-    uint32_t system_thread_handle = poly::threading::current_thread_id();
+    uint32_t system_thread_handle = xe::threading::current_thread_id();
     thread_id_ = 0x80000000 | system_thread_handle;
   }
-  backend_data_ = runtime->backend()->AllocThreadData();
+  backend_data_ = processor->backend()->AllocThreadData();
 
   if (!stack_address) {
-    stack_address_ = memory()->SystemHeapAlloc(stack_size);
+    // We must always allocate 64K as a guard region before stacks, as we can
+    // only Protect() on system page granularity.
+    auto heap = memory()->LookupHeap(0x40000000);
+    stack_size = (stack_size + 0xFFF) & 0xFFFFF000;
+    uint32_t stack_alignment = (stack_size & 0xF000) ? 0x1000 : 0x10000;
+    uint32_t stack_padding = heap->page_size();
+    uint32_t actual_stack_size = stack_padding + stack_size;
+    bool top_down = false;
+    switch (stack_type) {
+      case ThreadStackType::kKernelStack:
+        top_down = true;
+        break;
+      case ThreadStackType::kUserStack:
+        top_down = false;
+        break;
+      default:
+        assert_unhandled_case(stack_type);
+        break;
+    }
+    heap->AllocRange(0x40000000, 0x7FFFFFFF, actual_stack_size, stack_alignment,
+                     kMemoryAllocationReserve | kMemoryAllocationCommit,
+                     kMemoryProtectRead | kMemoryProtectWrite, top_down,
+                     &stack_address_);
+    assert_true(!(stack_address_ & 0xFFF));  // just to be safe
     stack_allocated_ = true;
+    stack_base_ = stack_address_ + actual_stack_size;
+    stack_limit_ = stack_address_ + stack_padding;
+    memory()->Fill(stack_address_, actual_stack_size, 0xBE);
+    heap->Protect(stack_address_, stack_padding, kMemoryProtectNoAccess);
   } else {
     stack_address_ = stack_address;
     stack_allocated_ = false;
+    stack_base_ = stack_address_ + stack_size;
+    stack_limit_ = stack_address_;
   }
   assert_not_zero(stack_address_);
 
@@ -56,29 +91,20 @@ ThreadState::ThreadState(Runtime* runtime, uint32_t thread_id,
 
   // Stash pointers to common structures that callbacks may need.
   context_->reserve_address = memory_->reserve_address();
-  context_->reserve_value = memory_->reserve_value();
   context_->virtual_membase = memory_->virtual_membase();
   context_->physical_membase = memory_->physical_membase();
-  context_->runtime = runtime;
+  context_->processor = processor_;
   context_->thread_state = this;
   context_->thread_id = thread_id_;
 
   // Set initial registers.
-  context_->r[1] = stack_address_ + stack_size;
-  context_->r[13] = thread_state_address_;
-
-  // Pad out stack a bit, as some games seem to overwrite the caller by about
-  // 16 to 32b.
-  context_->r[1] -= 64;
-
-  runtime_->debugger()->OnThreadCreated(this);
+  context_->r[1] = stack_base_;
+  context_->r[13] = pcr_address_;
 }
 
 ThreadState::~ThreadState() {
-  runtime_->debugger()->OnThreadDestroyed(this);
-
   if (backend_data_) {
-    runtime_->backend()->FreeThreadData(backend_data_);
+    processor_->backend()->FreeThreadData(backend_data_);
   }
   if (thread_state_ == this) {
     thread_state_ = nullptr;
@@ -86,7 +112,7 @@ ThreadState::~ThreadState() {
 
   _aligned_free(context_);
   if (stack_allocated_) {
-    memory()->SystemHeapFree(stack_address_);
+    memory()->LookupHeap(stack_address_)->Decommit(stack_address_, stack_size_);
   }
 }
 
@@ -97,31 +123,6 @@ void ThreadState::Bind(ThreadState* thread_state) {
 ThreadState* ThreadState::Get() { return thread_state_; }
 
 uint32_t ThreadState::GetThreadID() { return thread_state_->thread_id_; }
-
-void ThreadState::WriteRegisters(xdb::protocol::Registers* registers) {
-  registers->lr = context_->lr;
-  registers->ctr = context_->ctr;
-  registers->xer = 0xFEFEFEFE;
-  registers->cr[0] = context_->cr0.value;
-  registers->cr[1] = context_->cr1.value;
-  registers->cr[2] = context_->cr2.value;
-  registers->cr[3] = context_->cr3.value;
-  registers->cr[4] = context_->cr4.value;
-  registers->cr[5] = context_->cr5.value;
-  registers->cr[6] = context_->cr6.value;
-  registers->cr[7] = context_->cr7.value;
-  registers->fpscr = context_->fpscr.value;
-  registers->vscr = context_->vscr_sat;
-  static_assert(sizeof(registers->gpr) == sizeof(context_->r),
-                "structs must match");
-  static_assert(sizeof(registers->fpr) == sizeof(context_->f),
-                "structs must match");
-  static_assert(sizeof(registers->vr) == sizeof(context_->v),
-                "structs must match");
-  memcpy(registers->gpr, context_->r, sizeof(context_->r));
-  memcpy(registers->fpr, context_->f, sizeof(context_->f));
-  memcpy(registers->vr, context_->v, sizeof(context_->v));
-}
 
 }  // namespace cpu
 }  // namespace xe

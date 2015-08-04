@@ -16,18 +16,19 @@
 #include <unordered_map>
 #include <vector>
 
-#include "xenia/memory.h"
+#include "xenia/base/mutex.h"
 #include "xenia/cpu/symbol_info.h"
+#include "xenia/memory.h"
 
 namespace xe {
 namespace cpu {
 
 class Function;
-class Runtime;
+class Processor;
 
 class Module {
  public:
-  Module(Runtime* runtime);
+  Module(Processor* processor);
   virtual ~Module();
 
   Memory* memory() const { return memory_; }
@@ -37,32 +38,33 @@ class Module {
   virtual bool ContainsAddress(uint32_t address);
 
   SymbolInfo* LookupSymbol(uint32_t address, bool wait = true);
-  virtual SymbolInfo::Status DeclareFunction(uint32_t address,
-                                             FunctionInfo** out_symbol_info);
-  virtual SymbolInfo::Status DeclareVariable(uint32_t address,
-                                             VariableInfo** out_symbol_info);
+  virtual SymbolStatus DeclareFunction(uint32_t address,
+                                       FunctionInfo** out_symbol_info);
+  virtual SymbolStatus DeclareVariable(uint32_t address,
+                                       VariableInfo** out_symbol_info);
 
-  SymbolInfo::Status DefineFunction(FunctionInfo* symbol_info);
-  SymbolInfo::Status DefineVariable(VariableInfo* symbol_info);
+  SymbolStatus DefineFunction(FunctionInfo* symbol_info);
+  SymbolStatus DefineVariable(VariableInfo* symbol_info);
 
   void ForEachFunction(std::function<void(FunctionInfo*)> callback);
-  void ForEachFunction(size_t since, size_t& version,
-                       std::function<void(FunctionInfo*)> callback);
+  void ForEachSymbol(size_t start_index, size_t end_index,
+                     std::function<void(SymbolInfo*)> callback);
+  size_t QuerySymbolCount();
 
-  int ReadMap(const char* file_name);
+  bool ReadMap(const char* file_name);
 
  private:
-  SymbolInfo::Status DeclareSymbol(SymbolInfo::Type type, uint32_t address,
-                                   SymbolInfo** out_symbol_info);
-  SymbolInfo::Status DefineSymbol(SymbolInfo* symbol_info);
+  SymbolStatus DeclareSymbol(SymbolType type, uint32_t address,
+                             SymbolInfo** out_symbol_info);
+  SymbolStatus DefineSymbol(SymbolInfo* symbol_info);
 
  protected:
-  Runtime* runtime_;
+  Processor* processor_;
   Memory* memory_;
 
  private:
   // TODO(benvanik): replace with a better data structure.
-  std::mutex lock_;
+  xe::mutex lock_;
   std::unordered_map<uint32_t, SymbolInfo*> map_;
   std::vector<std::unique_ptr<SymbolInfo>> list_;
 };

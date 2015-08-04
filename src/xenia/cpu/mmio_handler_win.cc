@@ -9,7 +9,12 @@
 
 #include "xenia/cpu/mmio_handler.h"
 
-#include <Windows.h>
+#include "xenia/base/platform_win.h"
+#include "xenia/profiling.h"
+
+namespace xe {
+void CrashDump();
+}  // namespace xe
 
 namespace xe {
 namespace cpu {
@@ -18,7 +23,8 @@ LONG CALLBACK MMIOExceptionHandler(PEXCEPTION_POINTERS ex_info);
 
 class WinMMIOHandler : public MMIOHandler {
  public:
-  WinMMIOHandler(uint8_t* mapping_base) : MMIOHandler(mapping_base) {}
+  WinMMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase)
+      : MMIOHandler(virtual_membase, physical_membase) {}
   ~WinMMIOHandler() override;
 
  protected:
@@ -30,8 +36,9 @@ class WinMMIOHandler : public MMIOHandler {
                                  int32_t be_reg_index) override;
 };
 
-std::unique_ptr<MMIOHandler> CreateMMIOHandler(uint8_t* mapping_base) {
-  return std::make_unique<WinMMIOHandler>(mapping_base);
+std::unique_ptr<MMIOHandler> CreateMMIOHandler(uint8_t* virtual_membase,
+                                               uint8_t* physical_membase) {
+  return std::make_unique<WinMMIOHandler>(virtual_membase, physical_membase);
 }
 
 bool WinMMIOHandler::Initialize() {
@@ -55,6 +62,13 @@ WinMMIOHandler::~WinMMIOHandler() {
 // addresses in our range and call into the registered handlers, if any.
 // If there are none, we continue.
 LONG CALLBACK MMIOExceptionHandler(PEXCEPTION_POINTERS ex_info) {
+  // Fast path for SetThreadName.
+  if (ex_info->ExceptionRecord->ExceptionCode == 0x406D1388) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+
+  SCOPE_profile_cpu_i("cpu", "MMIOExceptionHandler");
+
   // http://msdn.microsoft.com/en-us/library/ms679331(v=vs.85).aspx
   // http://msdn.microsoft.com/en-us/library/aa363082(v=vs.85).aspx
   auto code = ex_info->ExceptionRecord->ExceptionCode;
@@ -67,6 +81,7 @@ LONG CALLBACK MMIOExceptionHandler(PEXCEPTION_POINTERS ex_info) {
     } else {
       // Failed to handle; continue search for a handler (and die if no other
       // handler is found).
+      xe::CrashDump();
       return EXCEPTION_CONTINUE_SEARCH;
     }
   }

@@ -9,20 +9,32 @@
 
 #include "xenia/cpu/backend/x64/x64_emitter.h"
 
+#include <gflags/gflags.h>
+
+#include <cstring>
+
+#include "xenia/base/assert.h"
+#include "xenia/base/atomic.h"
+#include "xenia/base/debugging.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/base/memory.h"
+#include "xenia/base/vec128.h"
 #include "xenia/cpu/backend/x64/x64_backend.h"
 #include "xenia/cpu/backend/x64/x64_code_cache.h"
 #include "xenia/cpu/backend/x64/x64_function.h"
 #include "xenia/cpu/backend/x64/x64_sequences.h"
-#include "xenia/cpu/backend/x64/x64_thunk_emitter.h"
-#include "xenia/cpu/cpu-private.h"
-#include "xenia/cpu/hir/hir_builder.h"
+#include "xenia/cpu/backend/x64/x64_stack_layout.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/debug_info.h"
-#include "xenia/cpu/runtime.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/cpu/symbol_info.h"
 #include "xenia/cpu/thread_state.h"
-#include "poly/vec128.h"
-#include "xdb/protocol.h"
+#include "xenia/debug/debugger.h"
 #include "xenia/profiling.h"
+
+DEFINE_bool(enable_debugprint_log, false,
+            "Log debugprint traps to the active debugger");
 
 namespace xe {
 namespace cpu {
@@ -33,23 +45,14 @@ namespace x64 {
 using namespace xe::cpu::hir;
 using namespace xe::cpu;
 
-using poly::vec128b;
-using poly::vec128f;
-using poly::vec128i;
-
 using namespace Xbyak;
 using xe::cpu::hir::HIRBuilder;
 using xe::cpu::hir::Instr;
 
-static const size_t MAX_CODE_SIZE = 1 * 1024 * 1024;
+static const size_t kMaxCodeSize = 1 * 1024 * 1024;
 
-static const size_t STASH_OFFSET = 32;
-static const size_t STASH_OFFSET_HIGH = 32 + 32;
-
-// If we are running with tracing on we have to store the EFLAGS in the stack,
-// otherwise our calls out to C to print will clear it before DID_CARRY/etc
-// can get the value.
-#define STORE_EFLAGS 1
+static const size_t kStashOffset = 32;
+// static const size_t kStashOffsetHigh = 32 + 32;
 
 const uint32_t X64Emitter::gpr_reg_map_[X64Emitter::GPR_COUNT] = {
     Operand::RBX, Operand::R12, Operand::R13, Operand::R14, Operand::R15,
@@ -60,56 +63,70 @@ const uint32_t X64Emitter::xmm_reg_map_[X64Emitter::XMM_COUNT] = {
 };
 
 X64Emitter::X64Emitter(X64Backend* backend, XbyakAllocator* allocator)
-    : CodeGenerator(MAX_CODE_SIZE, AutoGrow, allocator),
-      runtime_(backend->runtime()),
+    : CodeGenerator(kMaxCodeSize, AutoGrow, allocator),
+      processor_(backend->processor()),
       backend_(backend),
       code_cache_(backend->code_cache()),
-      allocator_(allocator),
-      current_instr_(0) {}
+      allocator_(allocator) {
+  if (FLAGS_enable_haswell_instructions) {
+    feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tAVX2) ? kX64EmitAVX2 : 0;
+    feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tFMA) ? kX64EmitFMA : 0;
+    feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tLZCNT) ? kX64EmitLZCNT : 0;
+    feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tBMI2) ? kX64EmitBMI2 : 0;
+    feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tF16C) ? kX64EmitF16C : 0;
+    feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tMOVBE) ? kX64EmitMovbe : 0;
+  }
 
-X64Emitter::~X64Emitter() {}
+  if (!cpu_.has(Xbyak::util::Cpu::tAVX)) {
+    XEFATAL(
+        "Your CPU is too old to support Xenia. See the FAQ for system "
+        "requirements at http://xenia.jp");
+    return;
+  }
+}
 
-int X64Emitter::Initialize() { return 0; }
+X64Emitter::~X64Emitter() = default;
 
-int X64Emitter::Emit(HIRBuilder* builder, uint32_t debug_info_flags,
-                     DebugInfo* debug_info, uint32_t trace_flags,
-                     void*& out_code_address, size_t& out_code_size) {
+bool X64Emitter::Emit(FunctionInfo* function_info, HIRBuilder* builder,
+                      uint32_t debug_info_flags, DebugInfo* debug_info,
+                      void*& out_code_address, size_t& out_code_size,
+                      std::vector<SourceMapEntry>& out_source_map) {
   SCOPE_profile_cpu_f("cpu");
 
   // Reset.
-  if (debug_info_flags & DEBUG_INFO_SOURCE_MAP) {
-    source_map_count_ = 0;
-    source_map_arena_.Reset();
-  }
-  trace_flags_ = trace_flags;
+  debug_info_ = debug_info;
+  debug_info_flags_ = debug_info_flags;
+  source_map_arena_.Reset();
 
   // Fill the generator with code.
   size_t stack_size = 0;
-  int result = Emit(builder, stack_size);
-  if (result) {
-    return result;
+  if (!Emit(builder, stack_size)) {
+    return false;
   }
 
   // Copy the final code to the cache and relocate it.
   out_code_size = getSize();
-  out_code_address = Emplace(stack_size);
+  out_code_address = Emplace(stack_size, function_info);
 
   // Stash source map.
-  if (debug_info_flags & DEBUG_INFO_SOURCE_MAP) {
-    debug_info->InitializeSourceMap(
-        source_map_count_, (SourceMapEntry*)source_map_arena_.CloneContents());
-  }
+  source_map_arena_.CloneContents(out_source_map);
 
-  return 0;
+  return true;
 }
 
-void* X64Emitter::Emplace(size_t stack_size) {
+void* X64Emitter::Emplace(size_t stack_size, FunctionInfo* function_info) {
   // To avoid changing xbyak, we do a switcharoo here.
   // top_ points to the Xbyak buffer, and since we are in AutoGrow mode
   // it has pending relocations. We copy the top_ to our buffer, swap the
   // pointer, relocate, then return the original scratch pointer for use.
   uint8_t* old_address = top_;
-  void* new_address = code_cache_->PlaceCode(top_, size_, stack_size);
+  void* new_address;
+  if (function_info) {
+    new_address = code_cache_->PlaceGuestCode(function_info->address(), top_,
+                                              size_, stack_size, function_info);
+  } else {
+    new_address = code_cache_->PlaceHostCode(0, top_, size_, stack_size);
+  }
   top_ = (uint8_t*)new_address;
   ready();
   top_ = old_address;
@@ -117,7 +134,10 @@ void* X64Emitter::Emplace(size_t stack_size) {
   return new_address;
 }
 
-int X64Emitter::Emit(HIRBuilder* builder, size_t& out_stack_size) {
+bool X64Emitter::Emit(HIRBuilder* builder, size_t& out_stack_size) {
+  Xbyak::Label epilog_label;
+  epilog_label_ = &epilog_label;
+
   // Calculate stack size. We need to align things to their natural sizes.
   // This could be much better (sort by type/etc).
   auto locals = builder->locals();
@@ -126,13 +146,13 @@ int X64Emitter::Emit(HIRBuilder* builder, size_t& out_stack_size) {
     auto slot = *it;
     size_t type_size = GetTypeSize(slot->type);
     // Align to natural size.
-    stack_offset = poly::align(stack_offset, type_size);
+    stack_offset = xe::align(stack_offset, type_size);
     slot->set_constant((uint32_t)stack_offset);
     stack_offset += type_size;
   }
   // Ensure 16b alignment.
   stack_offset -= StackLayout::GUEST_STACK_SIZE;
-  stack_offset = poly::align(stack_offset, static_cast<size_t>(16));
+  stack_offset = xe::align(stack_offset, static_cast<size_t>(16));
 
   // Function prolog.
   // Must be 16b aligned.
@@ -145,31 +165,45 @@ int X64Emitter::Emit(HIRBuilder* builder, size_t& out_stack_size) {
   // IMPORTANT: any changes to the prolog must be kept in sync with
   //     X64CodeCache, which dynamically generates exception information.
   //     Adding or changing anything here must be matched!
-  const bool emit_prolog = true;
   const size_t stack_size = StackLayout::GUEST_STACK_SIZE + stack_offset;
   assert_true((stack_size + 8) % 16 == 0);
   out_stack_size = stack_size;
   stack_size_ = stack_size;
-  if (emit_prolog) {
-    sub(rsp, (uint32_t)stack_size);
-    mov(qword[rsp + StackLayout::GUEST_RCX_HOME], rcx);
-    mov(qword[rsp + StackLayout::GUEST_RET_ADDR], rdx);
-    mov(qword[rsp + StackLayout::GUEST_CALL_RET_ADDR], 0);
-    mov(rdx, qword[rcx + 8]);  // membase
+  sub(rsp, (uint32_t)stack_size);
+  mov(qword[rsp + StackLayout::GUEST_RCX_HOME], rcx);
+  mov(qword[rsp + StackLayout::GUEST_RET_ADDR], rdx);
+  mov(qword[rsp + StackLayout::GUEST_CALL_RET_ADDR], 0);
+
+  // Safe now to do some tracing.
+  if (debug_info_flags_ & DebugInfoFlags::kDebugInfoTraceFunctions) {
+    // We require 32-bit addresses.
+    assert_true(uint64_t(debug_info_->trace_data().header()) < UINT_MAX);
+    auto trace_header = debug_info_->trace_data().header();
+
+    // Call count.
+    lock();
+    inc(qword[low_address(&trace_header->function_call_count)]);
+
+    // Get call history slot.
+    static_assert(debug::FunctionTraceData::kFunctionCallerHistoryCount == 4,
+                  "bitmask depends on count");
+    mov(rax, qword[low_address(&trace_header->function_call_count)]);
+    and_(rax, B00000011);
+
+    // Record call history value into slot (guest addr in RDX).
+    mov(dword[RegExp(uint32_t(uint64_t(
+                  low_address(&trace_header->function_caller_history)))) +
+              rax * 4],
+        edx);
+
+    // Calling thread. Load ax with thread ID.
+    EmitGetCurrentThreadId();
+    lock();
+    bts(qword[low_address(&trace_header->function_thread_use)], rax);
   }
 
-  uint64_t trace_base = runtime_->memory()->trace_base();
-  if (trace_base && trace_flags_ & TRACE_USER_CALLS) {
-    mov(rax, trace_base);
-    mov(r8d, static_cast<uint32_t>(sizeof(xdb::protocol::UserCallEvent)));
-    lock();
-    xadd(qword[rax], r8);
-    mov(rax, static_cast<uint64_t>(xdb::protocol::EventType::USER_CALL) |
-                 (static_cast<uint64_t>(0) << 8) | (0ull << 32));
-    mov(qword[r8], rax);
-    EmitGetCurrentThreadId();
-    mov(word[r8 + 2], ax);
-  }
+  // Load membase.
+  mov(rdx, qword[rcx + 8]);
 
   // Body.
   auto block = builder->first_block();
@@ -185,20 +219,10 @@ int X64Emitter::Emit(HIRBuilder* builder, size_t& out_stack_size) {
     const Instr* instr = block->instr_head;
     while (instr) {
       const Instr* new_tail = instr;
-
-      // Special handling of TRACE_SOURCE.
-      if (instr->opcode == &OPCODE_TRACE_SOURCE_info) {
-        if (trace_flags_ & TRACE_SOURCE) {
-          EmitTraceSource(instr);
-        }
-        instr = instr->next;
-        continue;
-      }
-
       if (!SelectSequence(*this, instr, &new_tail)) {
         // No sequence found!
         assert_always();
-        PLOGE("Unable to process HIR opcode %s", instr->opcode->name);
+        XELOGE("Unable to process HIR opcode %s", instr->opcode->name);
         break;
       }
       instr = new_tail;
@@ -208,156 +232,55 @@ int X64Emitter::Emit(HIRBuilder* builder, size_t& out_stack_size) {
   }
 
   // Function epilog.
-  L("epilog");
+  L(epilog_label);
+  epilog_label_ = nullptr;
   EmitTraceUserCallReturn();
-  if (emit_prolog) {
-    mov(rcx, qword[rsp + StackLayout::GUEST_RCX_HOME]);
-    add(rsp, (uint32_t)stack_size);
-  }
+  mov(rcx, qword[rsp + StackLayout::GUEST_RCX_HOME]);
+  add(rsp, (uint32_t)stack_size);
   ret();
 
-#if XE_DEBUG
-  nop();
-  nop();
-  nop();
-  nop();
-  nop();
-#endif  // XE_DEBUG
+  if (FLAGS_debug) {
+    nop();
+    nop();
+    nop();
+    nop();
+    nop();
+  }
 
-  return 0;
+  return true;
 }
 
 void X64Emitter::MarkSourceOffset(const Instr* i) {
   auto entry = source_map_arena_.Alloc<SourceMapEntry>();
   entry->source_offset = static_cast<uint32_t>(i->src1.offset);
   entry->hir_offset = uint32_t(i->block->ordinal << 16) | i->ordinal;
-  entry->code_offset = getSize();
-  source_map_count_++;
-}
+  entry->code_offset = static_cast<uint32_t>(getSize() + 1);
 
-void X64Emitter::EmitTraceSource(const Instr* instr) {
-  uint64_t trace_base = runtime_->memory()->trace_base();
-  if (!trace_base || !(trace_flags_ & TRACE_SOURCE)) {
-    return;
+  if (FLAGS_debug) {
+    nop();
+    nop();
+    mov(eax, entry->source_offset);
+    nop();
+    nop();
   }
 
-  // TODO(benvanik): make this a function call to some append fn.
-
-  uint8_t dest_reg_0 = instr->flags & 0xFF;
-  uint8_t dest_reg_1 = instr->flags >> 8;
-
-  xdb::protocol::EventType event_type;
-  size_t event_size = 0;
-  if (dest_reg_0 == 100) {
-    event_type = xdb::protocol::EventType::INSTR;
-    event_size = sizeof(xdb::protocol::InstrEvent);
-  } else if (dest_reg_1 == 100) {
-    if (dest_reg_0 & (1 << 7)) {
-      event_type = xdb::protocol::EventType::INSTR_R16;
-      event_size = sizeof(xdb::protocol::InstrEventR16);
-    } else {
-      event_type = xdb::protocol::EventType::INSTR_R8;
-      event_size = sizeof(xdb::protocol::InstrEventR8);
-    }
-  } else {
-    if (dest_reg_0 & (1 << 7) && dest_reg_1 & (1 << 7)) {
-      event_type = xdb::protocol::EventType::INSTR_R16_R16;
-      event_size = sizeof(xdb::protocol::InstrEventR16R16);
-    } else if (dest_reg_0 & (1 << 7) && !(dest_reg_1 & (1 << 7))) {
-      event_type = xdb::protocol::EventType::INSTR_R16_R8;
-      event_size = sizeof(xdb::protocol::InstrEventR16R8);
-    } else if (!(dest_reg_0 & (1 << 7)) && dest_reg_1 & (1 << 7)) {
-      event_type = xdb::protocol::EventType::INSTR_R8_R16;
-      event_size = sizeof(xdb::protocol::InstrEventR8R16);
-    } else if (!(dest_reg_0 & (1 << 7)) && !(dest_reg_1 & (1 << 7))) {
-      event_type = xdb::protocol::EventType::INSTR_R8_R8;
-      event_size = sizeof(xdb::protocol::InstrEventR8R8);
-    }
+  if (debug_info_flags_ & DebugInfoFlags::kDebugInfoTraceFunctionCoverage) {
+    auto trace_data = debug_info_->trace_data();
+    uint32_t instruction_index =
+        (entry->source_offset - trace_data.start_address()) / 4;
+    lock();
+    inc(qword[low_address(trace_data.instruction_execute_counts() +
+                          instruction_index * 8)]);
   }
-  assert_not_zero(event_size);
-
-  mov(rax, trace_base);
-  mov(r8d, static_cast<uint32_t>(event_size));
-  lock();
-  xadd(qword[rax], r8);
-  // r8 is now the pointer where we can write our event.
-
-  // Write the header, which is the same for everything (pretty much).
-  // Some event types ignore the dest reg, and that's fine.
-  uint64_t qword_0 = static_cast<uint64_t>(event_type) |
-                     (static_cast<uint64_t>(dest_reg_0) << 8) |
-                     (instr->src1.offset << 32);
-  mov(rax, qword_0);
-  mov(qword[r8], rax);
-
-  // Write thread ID.
-  EmitGetCurrentThreadId();
-  mov(word[r8 + 2], ax);
-
-  switch (event_type) {
-    default:
-    case xdb::protocol::EventType::INSTR:
-      break;
-    case xdb::protocol::EventType::INSTR_R8:
-    case xdb::protocol::EventType::INSTR_R16:
-      if (dest_reg_0 & (1 << 7)) {
-        EmitTraceSourceAppendValue(instr->src2.value, 8);
-      } else {
-        EmitTraceSourceAppendValue(instr->src2.value, 8);
-      }
-      break;
-    case xdb::protocol::EventType::INSTR_R8_R8:
-    case xdb::protocol::EventType::INSTR_R8_R16:
-    case xdb::protocol::EventType::INSTR_R16_R8:
-    case xdb::protocol::EventType::INSTR_R16_R16:
-      mov(word[r8 + 8], dest_reg_0 | static_cast<uint16_t>(dest_reg_1 << 8));
-      size_t offset = 8;
-      if (dest_reg_0 & (1 << 7)) {
-        EmitTraceSourceAppendValue(instr->src2.value, offset);
-        offset += 16;
-      } else {
-        EmitTraceSourceAppendValue(instr->src2.value, offset);
-        offset += 8;
-      }
-      if (dest_reg_1 & (1 << 7)) {
-        EmitTraceSourceAppendValue(instr->src3.value, offset);
-        offset += 16;
-      } else {
-        EmitTraceSourceAppendValue(instr->src3.value, offset);
-        offset += 8;
-      }
-      break;
-  }
-}
-
-void X64Emitter::EmitTraceSourceAppendValue(const Value* value,
-                                            size_t r8_offset) {
-  //
 }
 
 void X64Emitter::EmitGetCurrentThreadId() {
   // rcx must point to context. We could fetch from the stack if needed.
-  mov(ax, word[rcx + runtime_->frontend()->context_info()->thread_id_offset()]);
+  mov(ax,
+      word[rcx + processor_->frontend()->context_info()->thread_id_offset()]);
 }
 
-void X64Emitter::EmitTraceUserCallReturn() {
-  auto trace_base = runtime_->memory()->trace_base();
-  if (!trace_base || !(trace_flags_ & TRACE_USER_CALLS)) {
-    return;
-  }
-  mov(rdx, rax);
-  mov(rax, trace_base);
-  mov(r8d, static_cast<uint32_t>(sizeof(xdb::protocol::UserCallReturnEvent)));
-  lock();
-  xadd(qword[rax], r8);
-  mov(rax, static_cast<uint64_t>(xdb::protocol::EventType::USER_CALL_RETURN) |
-               (static_cast<uint64_t>(0) << 8) | (0ull << 32));
-  mov(qword[r8], rax);
-  EmitGetCurrentThreadId();
-  mov(word[r8 + 2], ax);
-  mov(rax, rdx);
-  ReloadEDX();
-}
+void X64Emitter::EmitTraceUserCallReturn() {}
 
 void X64Emitter::DebugBreak() {
   // TODO(benvanik): notify debugger.
@@ -367,12 +290,18 @@ void X64Emitter::DebugBreak() {
 uint64_t TrapDebugPrint(void* raw_context, uint64_t address) {
   auto thread_state = *reinterpret_cast<ThreadState**>(raw_context);
   uint32_t str_ptr = uint32_t(thread_state->context()->r[3]);
-  uint16_t str_len = uint16_t(thread_state->context()->r[4]);
+  // uint16_t str_len = uint16_t(thread_state->context()->r[4]);
   auto str = thread_state->memory()->TranslateVirtual<const char*>(str_ptr);
   // TODO(benvanik): truncate to length?
-  PLOGD("(DebugPrint) %s", str);
+  XELOGD("(DebugPrint) %s", str);
+
+  if (FLAGS_enable_debugprint_log) {
+    debugging::DebugPrint("(DebugPrint) %s\n", str);
+  }
+
   return 0;
 }
+
 void X64Emitter::Trap(uint16_t trap_type) {
   switch (trap_type) {
     case 20:
@@ -392,7 +321,7 @@ void X64Emitter::Trap(uint16_t trap_type) {
       // ?
       break;
     default:
-      PLOGW("Unknown trap type %d", trap_type);
+      XELOGW("Unknown trap type %d", trap_type);
       db(0xCC);
       break;
   }
@@ -404,199 +333,41 @@ void X64Emitter::UnimplementedInstr(const hir::Instr* i) {
   assert_always();
 }
 
-// Total size of ResolveFunctionSymbol call site in bytes.
-// Used to overwrite it with nops as needed.
-const size_t TOTAL_RESOLVE_SIZE = 27;
-const size_t ASM_OFFSET = 2 + 2 + 8 + 2 + 8;
-
-uint64_t ResolveFunctionSymbol(void* raw_context, uint64_t symbol_info_ptr) {
-  // TODO(benvanik): generate this thunk at runtime? or a shim?
-  auto thread_state = *reinterpret_cast<ThreadState**>(raw_context);
-  auto symbol_info = reinterpret_cast<FunctionInfo*>(symbol_info_ptr);
-
-  // Resolve function. This will demand compile as required.
-  Function* fn = NULL;
-  thread_state->runtime()->ResolveFunction(symbol_info->address(), &fn);
-  assert_not_null(fn);
-  auto x64_fn = static_cast<X64Function*>(fn);
-  uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
-
-// Overwrite the call site.
-// The return address points to ReloadRCX work after the call.
-#if XE_LIKE_WIN32
-  uint64_t return_address = reinterpret_cast<uint64_t>(_ReturnAddress());
-#else
-  uint64_t return_address =
-      reinterpret_cast<uint64_t>(__builtin_return_address(0));
-#endif  // XE_LIKE_WIN32
-#pragma pack(push, 1)
-  struct Asm {
-    uint16_t mov_rax;
-    uint64_t rax_constant;
-    uint16_t mov_rdx;
-    uint64_t rdx_constant;
-    uint16_t call_rax;
-    uint8_t mov_rcx[5];
-  };
-#pragma pack(pop)
-  static_assert_size(Asm, TOTAL_RESOLVE_SIZE);
-  Asm* code = reinterpret_cast<Asm*>(return_address - ASM_OFFSET);
-  code->rax_constant = addr;
-  code->call_rax = 0x9066;
-
-  // We need to return the target in rax so that it gets called.
-  return addr;
-}
-
-void X64Emitter::Call(const hir::Instr* instr, FunctionInfo* symbol_info) {
-  auto fn = reinterpret_cast<X64Function*>(symbol_info->function());
-  // Resolve address to the function to call and store in rax.
-  if (fn) {
-    mov(rax, reinterpret_cast<uint64_t>(fn->machine_code()));
-  } else {
-    size_t start = getSize();
-    // 2b + 8b constant
-    mov(rax, reinterpret_cast<uint64_t>(ResolveFunctionSymbol));
-    // 2b + 8b constant
-    mov(rdx, reinterpret_cast<uint64_t>(symbol_info));
-    // 2b
-    call(rax);
-    // 5b
-    ReloadECX();
-    size_t total_size = getSize() - start;
-    assert_true(total_size == TOTAL_RESOLVE_SIZE);
-    // EDX overwritten, don't bother reloading.
-  }
-
-  // Actually jump/call to rax.
-  if (instr->flags & CALL_TAIL) {
-    // Since we skip the prolog we need to mark the return here.
-    EmitTraceUserCallReturn();
-
-    // Pass the callers return address over.
-    mov(rdx, qword[rsp + StackLayout::GUEST_RET_ADDR]);
-
-    add(rsp, static_cast<uint32_t>(stack_size()));
-    jmp(rax);
-  } else {
-    // Return address is from the previous SET_RETURN_ADDRESS.
-    mov(rdx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
-    call(rax);
-  }
-}
-
-// NOTE: slot count limited by short jump size.
-const int kICSlotCount = 4;
-const int kICSlotSize = 23;
-const uint64_t kICSlotInvalidTargetAddress = 0x0F0F0F0F0F0F0F0F;
-
-uint64_t ResolveFunctionAddress(void* raw_context, uint32_t target_address) {
-  // TODO(benvanik): generate this thunk at runtime? or a shim?
+// This is used by the X64ThunkEmitter's ResolveFunctionThunk.
+extern "C" uint64_t ResolveFunction(void* raw_context,
+                                    uint32_t target_address) {
   auto thread_state = *reinterpret_cast<ThreadState**>(raw_context);
 
   // TODO(benvanik): required?
   assert_not_zero(target_address);
 
   Function* fn = NULL;
-  thread_state->runtime()->ResolveFunction(target_address, &fn);
+  thread_state->processor()->ResolveFunction(target_address, &fn);
   assert_not_null(fn);
   auto x64_fn = static_cast<X64Function*>(fn);
   uint64_t addr = reinterpret_cast<uint64_t>(x64_fn->machine_code());
 
-// Add an IC slot, if there is room.
-#if XE_LIKE_WIN32
-  uint64_t return_address = reinterpret_cast<uint64_t>(_ReturnAddress());
-#else
-  uint64_t return_address =
-      reinterpret_cast<uint64_t>(__builtin_return_address(0));
-#endif  // XE_LIKE_WIN32
-#pragma pack(push, 1)
-  struct Asm {
-    uint16_t cmp_rdx;
-    uint32_t address_constant;
-    uint16_t jmp_next_slot;
-    uint16_t mov_rax;
-    uint64_t target_constant;
-    uint8_t jmp_skip_resolve[5];
-  };
-#pragma pack(pop)
-  static_assert_size(Asm, kICSlotSize);
-  // TODO(benvanik): quick check table is full (so we don't have to enum slots)
-  // The return address points to ReloadRCX work after the call.
-  // To get the top of the table, look back a ways.
-  uint64_t table_start = return_address - 12 - kICSlotSize * kICSlotCount;
-  // NOTE: order matters here - we update the address BEFORE we switch the code
-  // over to passing the compare.
-  Asm* table_slot = reinterpret_cast<Asm*>(table_start);
-  bool wrote_ic = false;
-  for (int i = 0; i < kICSlotCount; ++i) {
-    if (poly::atomic_cas(kICSlotInvalidTargetAddress, addr,
-                         &table_slot->target_constant)) {
-      // Got slot! Just write the compare and we're done.
-      table_slot->address_constant = static_cast<uint32_t>(target_address);
-      wrote_ic = true;
-      break;
-    }
-    ++table_slot;
-  }
-  if (!wrote_ic) {
-    // TODO(benvanik): log that IC table is full.
-  }
-
-  // We need to return the target in rax so that it gets called.
   return addr;
 }
 
-void X64Emitter::CallIndirect(const hir::Instr* instr, const Reg64& reg) {
-  // Check if return.
-  if (instr->flags & CALL_POSSIBLE_RETURN) {
-    cmp(reg.cvt32(), dword[rsp + StackLayout::GUEST_RET_ADDR]);
-    je("epilog", CodeGenerator::T_NEAR);
-  }
-
-  if (reg.getIdx() != rdx.getIdx()) {
-    mov(rdx, reg);
-  }
-
-  inLocalLabel();
-  Xbyak::Label skip_resolve;
-
-  // TODO(benvanik): make empty tables skippable (cmp, jump right to resolve).
-
-  // IC table, initially empty.
-  // This will get filled in as functions are resolved.
-  // Note that we only have a limited cache, and once it's full all calls
-  // will fall through.
-  // TODO(benvanik): check miss rate when full and add a 2nd-level table?
-  // 0000000264BD4DC3 81 FA 0F0F0F0F         cmp         edx,0F0F0F0Fh
-  // 0000000264BD4DC9 75 0C                  jne         0000000264BD4DD7
-  // 0000000264BD4DCB 48 B8 0F0F0F0F0F0F0F0F mov         rax,0F0F0F0F0F0F0F0Fh
-  // 0000000264BD4DD5 EB XXXXXXXX            jmp         0000000264BD4E00
-  size_t table_start = getSize();
-  for (int i = 0; i < kICSlotCount; ++i) {
-    // Compare target address with constant, if matches jump there.
-    // Otherwise, fall through.
-    // 6b
-    cmp(edx, 0x0F0F0F0F);
-    Xbyak::Label next_slot;
-    // 2b
-    jne(next_slot, T_SHORT);
-    // Match! Load up rax and skip down to the jmp code.
-    // 10b
-    mov(rax, kICSlotInvalidTargetAddress);
-    // 5b
-    jmp(skip_resolve, T_NEAR);
-    L(next_slot);
-  }
-  size_t table_size = getSize() - table_start;
-  assert_true(table_size == kICSlotSize * kICSlotCount);
-
+void X64Emitter::Call(const hir::Instr* instr, FunctionInfo* symbol_info) {
+  assert_not_null(symbol_info);
+  auto fn = reinterpret_cast<X64Function*>(symbol_info->function());
   // Resolve address to the function to call and store in rax.
-  // We fall through to this when there are no hits in the IC table.
-  CallNative(ResolveFunctionAddress);
+  if (fn) {
+    // TODO(benvanik): is it worth it to do this? It removes the need for
+    // a ResolveFunction call, but makes the table less useful.
+    assert_zero(uint64_t(fn->machine_code()) & 0xFFFFFFFF00000000);
+    mov(eax, uint32_t(uint64_t(fn->machine_code())));
+  } else {
+    // Load the pointer to the indirection table maintained in X64CodeCache.
+    // The target dword will either contain the address of the generated code
+    // or a thunk to ResolveAddress.
+    mov(ebx, symbol_info->address());
+    mov(eax, dword[ebx]);
+  }
 
   // Actually jump/call to rax.
-  L(skip_resolve);
   if (instr->flags & CALL_TAIL) {
     // Since we skip the prolog we need to mark the return here.
     EmitTraceUserCallReturn();
@@ -609,68 +380,81 @@ void X64Emitter::CallIndirect(const hir::Instr* instr, const Reg64& reg) {
   } else {
     // Return address is from the previous SET_RETURN_ADDRESS.
     mov(rdx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
+
     call(rax);
   }
+}
 
-  outLocalLabel();
+void X64Emitter::CallIndirect(const hir::Instr* instr, const Reg64& reg) {
+  // Check if return.
+  if (instr->flags & CALL_POSSIBLE_RETURN) {
+    cmp(reg.cvt32(), dword[rsp + StackLayout::GUEST_RET_ADDR]);
+    je(epilog_label(), CodeGenerator::T_NEAR);
+  }
+
+  // Load the pointer to the indirection table maintained in X64CodeCache.
+  // The target dword will either contain the address of the generated code
+  // or a thunk to ResolveAddress.
+  if (reg.cvt32() != ebx) {
+    mov(ebx, reg.cvt32());
+  }
+  mov(eax, dword[ebx]);
+
+  // Actually jump/call to rax.
+  if (instr->flags & CALL_TAIL) {
+    // Since we skip the prolog we need to mark the return here.
+    EmitTraceUserCallReturn();
+
+    // Pass the callers return address over.
+    mov(rdx, qword[rsp + StackLayout::GUEST_RET_ADDR]);
+
+    add(rsp, static_cast<uint32_t>(stack_size()));
+    jmp(rax);
+  } else {
+    // Return address is from the previous SET_RETURN_ADDRESS.
+    mov(rdx, qword[rsp + StackLayout::GUEST_CALL_RET_ADDR]);
+
+    call(rax);
+  }
 }
 
 uint64_t UndefinedCallExtern(void* raw_context, uint64_t symbol_info_ptr) {
   auto symbol_info = reinterpret_cast<FunctionInfo*>(symbol_info_ptr);
-  PLOGW("undefined extern call to %.8llX %s", symbol_info->address(),
-        symbol_info->name().c_str());
+  XELOGW("undefined extern call to %.8X %s", symbol_info->address(),
+         symbol_info->name().c_str());
   return 0;
 }
 void X64Emitter::CallExtern(const hir::Instr* instr,
                             const FunctionInfo* symbol_info) {
-  assert_true(symbol_info->behavior() == FunctionInfo::BEHAVIOR_EXTERN);
-
-  uint64_t trace_base = runtime_->memory()->trace_base();
-  if (trace_base & trace_flags_ & TRACE_EXTERN_CALLS) {
-    mov(rax, trace_base);
-    mov(r8d, static_cast<uint32_t>(sizeof(xdb::protocol::KernelCallEvent)));
-    lock();
-    xadd(qword[rax], r8);
-    // TODO(benvanik): get module/ordinal.
-    uint32_t module_id = 0;
-    uint32_t ordinal = 0;
-    mov(rax, static_cast<uint64_t>(xdb::protocol::EventType::KERNEL_CALL) |
-                 (static_cast<uint64_t>(0) << 8) | (module_id << 16) |
-                 (ordinal));
-    mov(qword[r8], rax);
-    EmitGetCurrentThreadId();
-    mov(word[r8 + 2], ax);
-  }
-
-  if (!symbol_info->extern_handler()) {
-    CallNative(UndefinedCallExtern, reinterpret_cast<uint64_t>(symbol_info));
-  } else {
+  if (symbol_info->behavior() == FunctionBehavior::kBuiltin &&
+      symbol_info->builtin_handler()) {
     // rcx = context
     // rdx = target host function
     // r8  = arg0
     // r9  = arg1
-    mov(rdx, reinterpret_cast<uint64_t>(symbol_info->extern_handler()));
-    mov(r8, reinterpret_cast<uint64_t>(symbol_info->extern_arg0()));
-    mov(r9, reinterpret_cast<uint64_t>(symbol_info->extern_arg1()));
+    mov(rdx, reinterpret_cast<uint64_t>(symbol_info->builtin_handler()));
+    mov(r8, reinterpret_cast<uint64_t>(symbol_info->builtin_arg0()));
+    mov(r9, reinterpret_cast<uint64_t>(symbol_info->builtin_arg1()));
     auto thunk = backend()->guest_to_host_thunk();
     mov(rax, reinterpret_cast<uint64_t>(thunk));
     call(rax);
     ReloadECX();
     ReloadEDX();
     // rax = host return
-  }
-  if (trace_base && trace_flags_ & TRACE_EXTERN_CALLS) {
-    mov(rax, trace_base);
-    mov(r8d,
-        static_cast<uint32_t>(sizeof(xdb::protocol::KernelCallReturnEvent)));
-    lock();
-    xadd(qword[rax], r8);
-    mov(rax,
-        static_cast<uint64_t>(xdb::protocol::EventType::KERNEL_CALL_RETURN) |
-            (static_cast<uint64_t>(0) << 8) | (0));
-    mov(qword[r8], rax);
-    EmitGetCurrentThreadId();
-    mov(word[r8 + 2], ax);
+  } else if (symbol_info->behavior() == FunctionBehavior::kExtern &&
+             symbol_info->extern_handler()) {
+    // rcx = context
+    // rdx = target host function
+    mov(rdx, reinterpret_cast<uint64_t>(symbol_info->extern_handler()));
+    mov(r8, qword[rcx + offsetof(cpu::frontend::PPCContext, kernel_state)]);
+    auto thunk = backend()->guest_to_host_thunk();
+    mov(rax, reinterpret_cast<uint64_t>(thunk));
+    call(rax);
+    ReloadECX();
+    ReloadEDX();
+    // rax = host return
+  } else {
+    CallNative(UndefinedCallExtern, reinterpret_cast<uint64_t>(symbol_info));
   }
 }
 
@@ -706,9 +490,10 @@ void X64Emitter::CallNative(uint64_t (*fn)(void* raw_context, uint64_t arg0),
 
 void X64Emitter::CallNativeSafe(void* fn) {
   // rcx = context
-  // rdx = target host function
+  // rdx = target function
   // r8  = arg0
   // r9  = arg1
+  // r10 = arg2
   mov(rdx, reinterpret_cast<uint64_t>(fn));
   auto thunk = backend()->guest_to_host_thunk();
   mov(rax, reinterpret_cast<uint64_t>(thunk));
@@ -747,25 +532,6 @@ void X64Emitter::nop(size_t length) {
   }
 }
 
-void X64Emitter::LoadEflags() {
-#if STORE_EFLAGS
-  mov(eax, dword[rsp + STASH_OFFSET]);
-  btr(eax, 0);
-#else
-// EFLAGS already present.
-#endif  // STORE_EFLAGS
-}
-
-void X64Emitter::StoreEflags() {
-#if STORE_EFLAGS
-  pushf();
-  pop(dword[rsp + STASH_OFFSET]);
-#else
-// EFLAGS should have CA set?
-// (so long as we don't fuck with it)
-#endif  // STORE_EFLAGS
-}
-
 bool X64Emitter::ConstantFitsIn32Reg(uint64_t v) {
   if ((v & ~0x7FFFFFFF) == 0) {
     // Fits under 31 bits, so just load using normal mov.
@@ -797,7 +563,7 @@ void X64Emitter::MovMem64(const RegExp& addr, uint64_t v) {
   }
 }
 
-Address X64Emitter::GetXmmConstPtr(XmmConst id) {
+uint32_t X64Emitter::PlaceData(Memory* memory) {
   static const vec128_t xmm_consts[] = {
       /* XMMZero                */ vec128f(0.0f),
       /* XMMOne                 */ vec128f(1.0f),
@@ -873,12 +639,14 @@ Address X64Emitter::GetXmmConstPtr(XmmConst id) {
       /* XMMShortMinPS          */ vec128f(SHRT_MIN),
       /* XMMShortMaxPS          */ vec128f(SHRT_MAX),
   };
-  // TODO(benvanik): cache base pointer somewhere? stack? It'd be nice to
-  // prevent this move.
-  // TODO(benvanik): move to predictable location in PPCContext? could then
-  // just do rcx relative addression with no rax overwriting.
-  mov(rax, (uint64_t)&xmm_consts[id]);
-  return ptr[rax];
+  uint32_t ptr = memory->SystemHeapAlloc(sizeof(xmm_consts));
+  std::memcpy(memory->TranslateVirtual(ptr), xmm_consts, sizeof(xmm_consts));
+  return ptr;
+}
+
+Address X64Emitter::GetXmmConstPtr(XmmConst id) {
+  // Load through fixed constant table setup by PlaceData.
+  return ptr[rdx + backend_->emitter_data() + sizeof(vec128_t) * id];
 }
 
 void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, const vec128_t& v) {
@@ -893,9 +661,9 @@ void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, const vec128_t& v) {
   } else {
     // TODO(benvanik): see what other common values are.
     // TODO(benvanik): build constant table - 99% are reused.
-    MovMem64(rsp + STASH_OFFSET, v.low);
-    MovMem64(rsp + STASH_OFFSET + 8, v.high);
-    vmovdqa(dest, ptr[rsp + STASH_OFFSET]);
+    MovMem64(rsp + kStashOffset, v.low);
+    MovMem64(rsp + kStashOffset + 8, v.high);
+    vmovdqa(dest, ptr[rsp + kStashOffset]);
   }
 }
 
@@ -938,7 +706,7 @@ void X64Emitter::LoadConstantXmm(Xbyak::Xmm dest, double v) {
 }
 
 Address X64Emitter::StashXmm(int index, const Xmm& r) {
-  auto addr = ptr[rsp + STASH_OFFSET + (index * 16)];
+  auto addr = ptr[rsp + kStashOffset + (index * 16)];
   vmovups(addr, r);
   return addr;
 }

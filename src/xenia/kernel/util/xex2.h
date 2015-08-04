@@ -10,9 +10,10 @@
 #ifndef XENIA_KERNEL_UTIL_XEX2_H_
 #define XENIA_KERNEL_UTIL_XEX2_H_
 
-#include "xenia/common.h"
 #include "xenia/kernel/util/xex2_info.h"
 #include "xenia/memory.h"
+
+namespace xe {}  // namespace xe
 
 typedef struct { int reserved; } xe_xex2_options_t;
 
@@ -25,7 +26,7 @@ typedef struct {
   uint32_t thunk_address;  // NULL or address of thunk
 } xe_xex2_import_info_t;
 
-enum xe_pe_section_flags_e {
+enum xe_pe_section_flags_e : uint32_t {
   kXEPESectionContainsCode = 0x00000020,
   kXEPESectionContainsDataInit = 0x00000040,
   kXEPESectionContainsDataUninit = 0x00000080,
@@ -44,6 +45,13 @@ class PESection {
   uint32_t flags;  // kXEPESection*
 };
 
+struct PEExport {
+  const char* name;
+  uint32_t ordinal;
+
+  uint64_t addr;  // Function address
+};
+
 xe_xex2_ref xe_xex2_load(xe::Memory* memory, const void* addr,
                          const size_t length, xe_xex2_options_t options);
 void xe_xex2_dealloc(xe_xex2_ref xex);
@@ -55,5 +63,8 @@ int xe_xex2_get_import_infos(xe_xex2_ref xex,
                              const xe_xex2_import_library_t* library,
                              xe_xex2_import_info_t** out_import_infos,
                              size_t* out_import_info_count);
+
+uint32_t xe_xex2_lookup_export(xe_xex2_ref xex, const char* name);
+uint32_t xe_xex2_lookup_export(xe_xex2_ref xex, uint16_t ordinal);
 
 #endif  // XENIA_KERNEL_UTIL_XEX2_H_

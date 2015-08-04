@@ -12,12 +12,11 @@
 
 #include <string>
 
-#include "poly/string_buffer.h"
-#include "xenia/common.h"
-#include "xenia/gpu/gl4/gl_context.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/gpu/gl4/gl4_shader.h"
 #include "xenia/gpu/ucode.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/ui/gl/gl_context.h"
 
 namespace xe {
 namespace gpu {
@@ -39,21 +38,15 @@ class GL4ShaderTranslator {
 
  protected:
   ShaderType shader_type_;
-  const uint32_t* dwords_;
+  const uint32_t* dwords_ = nullptr;
 
   static const int kOutputCapacity = 64 * 1024;
-  poly::StringBuffer output_;
+  StringBuffer output_;
 
   bool is_vertex_shader() const { return shader_type_ == ShaderType::kVertex; }
   bool is_pixel_shader() const { return shader_type_ == ShaderType::kPixel; }
 
   void Reset(GL4Shader* shader);
-  void Append(const char* format, ...) {
-    va_list args;
-    va_start(args, format);
-    output_.AppendVarargs(format, args);
-    va_end(args);
-  }
 
   void AppendSrcReg(const ucode::instr_alu_t& op, int i);
   void AppendSrcReg(const ucode::instr_alu_t& op, uint32_t num, uint32_t type,
@@ -163,6 +156,8 @@ class GL4ShaderTranslator {
   bool TranslateBlocks(GL4Shader* shader);
   bool TranslateExec(const ucode::instr_cf_exec_t& cf);
   bool TranslateJmp(const ucode::instr_cf_jmp_call_t& cf);
+  bool TranslateLoopStart(const ucode::instr_cf_loop_t& cf);
+  bool TranslateLoopEnd(const ucode::instr_cf_loop_t& cf);
   bool TranslateVertexFetch(const ucode::instr_fetch_vtx_t* vtx, int sync);
   bool TranslateTextureFetch(const ucode::instr_fetch_tex_t* tex, int sync);
 };

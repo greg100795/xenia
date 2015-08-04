@@ -11,7 +11,7 @@
 
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/compiler/compiler.h"
-#include "xenia/cpu/runtime.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/profiling.h"
 
 namespace xe {
@@ -29,7 +29,7 @@ ControlFlowAnalysisPass::ControlFlowAnalysisPass() : CompilerPass() {}
 
 ControlFlowAnalysisPass::~ControlFlowAnalysisPass() {}
 
-int ControlFlowAnalysisPass::Run(HIRBuilder* builder) {
+bool ControlFlowAnalysisPass::Run(HIRBuilder* builder) {
   // Reset edges for all blocks. Needed to be re-runnable.
   // Note that this wastes a bunch of arena memory, so we shouldn't
   // re-run too often.
@@ -71,7 +71,7 @@ int ControlFlowAnalysisPass::Run(HIRBuilder* builder) {
     block = block->next;
   }
 
-  return 0;
+  return true;
 }
 
 }  // namespace passes

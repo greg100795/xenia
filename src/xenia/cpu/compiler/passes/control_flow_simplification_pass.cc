@@ -11,7 +11,7 @@
 
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/compiler/compiler.h"
-#include "xenia/cpu/runtime.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/profiling.h"
 
 namespace xe {
@@ -30,10 +30,22 @@ ControlFlowSimplificationPass::ControlFlowSimplificationPass()
 
 ControlFlowSimplificationPass::~ControlFlowSimplificationPass() {}
 
-int ControlFlowSimplificationPass::Run(HIRBuilder* builder) {
+bool ControlFlowSimplificationPass::Run(HIRBuilder* builder) {
+  // Walk forwards and kill any unreachable blocks.
+  // Do this before merging.
+  auto block = builder->first_block();
+  while (block) {
+    auto next_block = block->next;
+    if (!block->incoming_edge_head && block->prev) {
+      // Block is in the interior and has no incoming edges - kill it.
+      builder->RemoveBlock(block);
+    }
+    block = next_block;
+  }
+
   // Walk backwards and merge blocks if possible.
   bool merged_any = false;
-  auto block = builder->last_block();
+  block = builder->last_block();
   while (block) {
     auto prev_block = block->prev;
     const uint32_t expected = Edge::DOMINATES | Edge::UNCONDITIONAL;
@@ -52,7 +64,7 @@ int ControlFlowSimplificationPass::Run(HIRBuilder* builder) {
     block = prev_block;
   }
 
-  return 0;
+  return true;
 }
 
 }  // namespace passes

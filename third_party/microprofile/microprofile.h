@@ -469,7 +469,7 @@ enum MicroProfileDrawMask
 	MP_DRAW_HIDDEN		= 0x3,
 };
 
-enum MicroProfileDrawBarsMask
+enum MicroProfileDrawBarsMask : uint32_t
 {
 	MP_DRAW_TIMERS 				= 0x1,
 	MP_DRAW_AVERAGE				= 0x2,
@@ -1666,7 +1666,7 @@ uint32_t MicroProfileWebServerPort()
 
 void MicroProfileDumpHtml(const char* pFile)
 {
-	uint32_t nLen = strlen(pFile);
+	uint32_t nLen = uint32_t(strlen(pFile));
 	if(nLen > sizeof(S.HtmlDumpPath)-1)
 	{
 		return;
@@ -1914,7 +1914,7 @@ static uint64_t g_nMicroProfileDataSent = 0;
 void MicroProfileWriteSocket(void* Handle, size_t nSize, const char* pData)
 {
 	g_nMicroProfileDataSent += nSize;
-	send(*(MpSocket*)Handle, pData, nSize, 0);
+	send(*(MpSocket*)Handle, pData, int(nSize), 0);
 }
 
 
@@ -2068,7 +2068,7 @@ bool MicroProfileWebServerUpdate()
 #include <strsafe.h>
 
 
-static GUID g_MicroProfileThreadClassGuid = { 0x3d6fa8d1, 0xfe05, 0x11d0, 0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c };
+static GUID g_MicroProfileThreadClassGuid = { 0x3d6fa8d1, 0xfe05, 0x11d0, {0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c } };
 
 struct MicroProfileSCSwitch
 {
@@ -2138,7 +2138,7 @@ void MicroProfileContextSwitchStopTrace()
 
 	EVENT_TRACE_LOGFILE log;
 	ZeroMemory(&log, sizeof(log));
-	log.LoggerName = KERNEL_LOGGER_NAME;
+	log.LoggerName = (LPWSTR)KERNEL_LOGGER_NAME;
 	log.ProcessTraceMode = 0;
 	TRACEHANDLE hLog = OpenTrace(&log);
 	if (hLog)
@@ -2183,7 +2183,7 @@ void MicroProfileTraceThread(int unused)
 	EVENT_TRACE_LOGFILE log;
 	ZeroMemory(&log, sizeof(log));
 
-	log.LoggerName = KERNEL_LOGGER_NAME;
+	log.LoggerName = (LPWSTR)KERNEL_LOGGER_NAME;
 	log.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
 	log.EventCallback = MicroProfileContextSwitchCallback;
 	log.BufferCallback = MicroProfileBufferCallback;

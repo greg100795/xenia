@@ -7,7 +7,10 @@
  ******************************************************************************
  */
 
-#include "xenia/common.h"
+#include "xenia/base/atomic.h"
+#include "xenia/base/clock.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/mutex.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/dispatcher.h"
 #include "xenia/kernel/kernel_state.h"
@@ -17,6 +20,7 @@
 #include "xenia/kernel/objects/xsemaphore.h"
 #include "xenia/kernel/objects/xthread.h"
 #include "xenia/kernel/objects/xtimer.h"
+#include "xenia/kernel/objects/xuser_module.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl_private.h"
 #include "xenia/xbox.h"
@@ -37,14 +41,14 @@ namespace kernel {
 
 // RtlGetLastError:
 // lwz r11, 0x150(r13)
-// if (r11 != 0) {
+// if (r11 == 0) {
 //   lwz r11, 0x100(r13)
 //   stw r3, 0x160(r11)
 // }
 
 // RtlSetLastError:
 // lwz r11, 0x150(r13)
-// if (r11 != 0) {
+// if (r11 == 0) {
 //   lwz r11, 0x100(r13)
 //   stw r3, 0x160(r11)
 // }
@@ -52,23 +56,26 @@ namespace kernel {
 // RtlSetLastNTError:
 // r3 = RtlNtStatusToDosError(r3)
 // lwz r11, 0x150(r13)
-// if (r11 != 0) {
+// if (r11 == 0) {
 //   lwz r11, 0x100(r13)
 //   stw r3, 0x160(r11)
 // }
 
-void AssertNoNameCollision(KernelState* state, uint32_t obj_attributes_ptr) {
+void AssertNoNameCollision(KernelState* kernel_state,
+                           uint32_t obj_attributes_ptr) {
   // If the name exists and its type matches, we can return that (ref+1)
   // with a success of NAME_EXISTS.
   // If the name exists and its type doesn't match, we do NAME_COLLISION.
   // Otherwise, we add like normal.
-  uint32_t name_str_ptr = poly::load_and_swap<uint32_t>(
-      state->memory()->TranslateVirtual(obj_attributes_ptr + 4));
-  if (name_str_ptr) {
-    X_ANSI_STRING name_str(state->memory()->virtual_membase(), name_str_ptr);
-    auto name = name_str.to_string();
+  if (!obj_attributes_ptr) {
+    return;
+  }
+  auto name = X_ANSI_STRING::to_string_indirect(
+      kernel_state->memory()->virtual_membase(), obj_attributes_ptr + 4);
+  if (!name.empty()) {
     X_HANDLE handle = X_INVALID_HANDLE_VALUE;
-    X_RESULT result = state->object_table()->GetObjectByName(name, &handle);
+    X_RESULT result =
+        kernel_state->object_table()->GetObjectByName(name, &handle);
     if (XSUCCEEDED(result)) {
       // Found something!
       assert_always("Existing names not implemented");
@@ -76,7 +83,8 @@ void AssertNoNameCollision(KernelState* state, uint32_t obj_attributes_ptr) {
   }
 }
 
-SHIM_CALL ExCreateThread_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL ExCreateThread_shim(PPCContext* ppc_context,
+                              KernelState* kernel_state) {
   uint32_t handle_ptr = SHIM_GET_ARG_32(0);
   uint32_t stack_size = SHIM_GET_ARG_32(1);
   uint32_t thread_id_ptr = SHIM_GET_ARG_32(2);
@@ -89,6 +97,7 @@ SHIM_CALL ExCreateThread_shim(PPCContext* ppc_state, KernelState* state) {
          stack_size, thread_id_ptr, xapi_thread_startup, start_address,
          start_context, creation_flags);
 
+  // http://jafile.com/uploads/scoop/main.cpp.txt
   // DWORD
   // LPHANDLE Handle,
   // DWORD    StackSize,
@@ -98,13 +107,21 @@ SHIM_CALL ExCreateThread_shim(PPCContext* ppc_state, KernelState* state) {
   // LPVOID   StartContext,
   // DWORD    CreationFlags // 0x80?
 
-  XThread* thread = new XThread(state, stack_size, xapi_thread_startup,
-                                start_address, start_context, creation_flags);
+  // Inherit default stack size
+  if (stack_size == 0) {
+    stack_size = kernel_state->GetExecutableModule()->stack_size();
+  }
+
+  // Stack must be aligned to 16kb pages
+  stack_size = std::max((uint32_t)0x4000, ((stack_size + 0xFFF) & 0xFFFFF000));
+
+  auto thread = object_ref<XThread>(
+      new XThread(kernel_state, stack_size, xapi_thread_startup, start_address,
+                  start_context, creation_flags, true));
 
   X_STATUS result = thread->Create();
   if (XFAILED(result)) {
     // Failed!
-    thread->Release();
     XELOGE("Thread creation failed: %.8X", result);
     SHIM_SET_RETURN_32(result);
     return;
@@ -121,7 +138,8 @@ SHIM_CALL ExCreateThread_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL ExTerminateThread_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL ExTerminateThread_shim(PPCContext* ppc_context,
+                                 KernelState* kernel_state) {
   uint32_t exit_code = SHIM_GET_ARG_32(0);
 
   XELOGD("ExTerminateThread(%d)", exit_code);
@@ -133,76 +151,78 @@ SHIM_CALL ExTerminateThread_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtResumeThread_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtResumeThread_shim(PPCContext* ppc_context,
+                              KernelState* kernel_state) {
   uint32_t handle = SHIM_GET_ARG_32(0);
   uint32_t suspend_count_ptr = SHIM_GET_ARG_32(1);
 
   XELOGD("NtResumeThread(%.8X, %.8X)", handle, suspend_count_ptr);
 
-  XThread* thread = NULL;
-  X_STATUS result =
-      state->object_table()->GetObject(handle, (XObject**)&thread);
-  uint32_t suspend_count;
-  if (XSUCCEEDED(result)) {
+  X_RESULT result = X_STATUS_INVALID_HANDLE;
+  uint32_t suspend_count = 0;
+
+  auto thread = kernel_state->object_table()->LookupObject<XThread>(handle);
+  if (thread) {
     result = thread->Resume(&suspend_count);
-    thread->Release();
   }
-  if (XSUCCEEDED(result)) {
-    if (suspend_count_ptr) {
-      SHIM_SET_MEM_32(suspend_count_ptr, suspend_count);
-    }
+  if (suspend_count_ptr) {
+    SHIM_SET_MEM_32(suspend_count_ptr, suspend_count);
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL KeResumeThread_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeResumeThread_shim(PPCContext* ppc_context,
+                              KernelState* kernel_state) {
   uint32_t thread_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("KeResumeThread(%.8X)", thread_ptr);
 
-  X_STATUS result;
-  XThread* thread =
-      (XThread*)XObject::GetObject(state, SHIM_MEM_ADDR(thread_ptr));
+  X_STATUS result = X_STATUS_SUCCESS;
+  auto thread = XObject::GetNativeObject<XThread>(kernel_state,
+                                                  SHIM_MEM_ADDR(thread_ptr));
   if (thread) {
     result = thread->Resume();
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtSuspendThread_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtSuspendThread_shim(PPCContext* ppc_context,
+                               KernelState* kernel_state) {
   uint32_t handle = SHIM_GET_ARG_32(0);
   uint32_t suspend_count_ptr = SHIM_GET_ARG_32(1);
 
   XELOGD("NtSuspendThread(%.8X, %.8X)", handle, suspend_count_ptr);
 
-  XThread* thread = NULL;
-  X_STATUS result =
-      state->object_table()->GetObject(handle, (XObject**)&thread);
-  uint32_t suspend_count;
-  if (XSUCCEEDED(result)) {
+  X_RESULT result = X_STATUS_SUCCESS;
+  uint32_t suspend_count = 0;
+
+  auto thread = kernel_state->object_table()->LookupObject<XThread>(handle);
+  if (thread) {
     result = thread->Suspend(&suspend_count);
-    thread->Release();
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
-  if (XSUCCEEDED(result)) {
-    if (suspend_count_ptr) {
-      SHIM_SET_MEM_32(suspend_count_ptr, suspend_count);
-    }
+  if (suspend_count_ptr) {
+    SHIM_SET_MEM_32(suspend_count_ptr, suspend_count);
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL KeSetAffinityThread_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeSetAffinityThread_shim(PPCContext* ppc_context,
+                                   KernelState* kernel_state) {
   uint32_t thread_ptr = SHIM_GET_ARG_32(0);
   uint32_t affinity = SHIM_GET_ARG_32(1);
 
   XELOGD("KeSetAffinityThread(%.8X, %.8X)", thread_ptr, affinity);
 
-  XThread* thread =
-      (XThread*)XObject::GetObject(state, SHIM_MEM_ADDR(thread_ptr));
+  auto thread = XObject::GetNativeObject<XThread>(kernel_state,
+                                                  SHIM_MEM_ADDR(thread_ptr));
   if (thread) {
     thread->SetAffinity(affinity);
   }
@@ -210,16 +230,16 @@ SHIM_CALL KeSetAffinityThread_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(affinity);
 }
 
-SHIM_CALL KeQueryBasePriorityThread_shim(PPCContext* ppc_state,
-                                         KernelState* state) {
+SHIM_CALL KeQueryBasePriorityThread_shim(PPCContext* ppc_context,
+                                         KernelState* kernel_state) {
   uint32_t thread_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("KeQueryBasePriorityThread(%.8X)", thread_ptr);
 
   int32_t priority = 0;
 
-  XThread* thread =
-      (XThread*)XObject::GetObject(state, SHIM_MEM_ADDR(thread_ptr));
+  auto thread = XObject::GetNativeObject<XThread>(kernel_state,
+                                                  SHIM_MEM_ADDR(thread_ptr));
   if (thread) {
     priority = thread->QueryPriority();
   }
@@ -227,8 +247,8 @@ SHIM_CALL KeQueryBasePriorityThread_shim(PPCContext* ppc_state,
   SHIM_SET_RETURN_32(priority);
 }
 
-SHIM_CALL KeSetBasePriorityThread_shim(PPCContext* ppc_state,
-                                       KernelState* state) {
+SHIM_CALL KeSetBasePriorityThread_shim(PPCContext* ppc_context,
+                                       KernelState* kernel_state) {
   uint32_t thread_ptr = SHIM_GET_ARG_32(0);
   uint32_t increment = SHIM_GET_ARG_32(1);
 
@@ -236,8 +256,18 @@ SHIM_CALL KeSetBasePriorityThread_shim(PPCContext* ppc_state,
 
   int32_t prev_priority = 0;
 
-  XThread* thread =
-      (XThread*)XObject::GetObject(state, SHIM_MEM_ADDR(thread_ptr));
+  object_ref<XThread> thread;
+  if (thread_ptr < 0x1000) {
+    // They passed in a handle (for some reason)
+    thread = kernel_state->object_table()->LookupObject<XThread>(thread_ptr);
+
+    // Log it in case this is the source of any problems in the future
+    XELOGD("KeSetBasePriorityThread - Interpreting thread ptr as handle!");
+  } else {
+    thread = XObject::GetNativeObject<XThread>(kernel_state,
+                                               SHIM_MEM_ADDR(thread_ptr));
+  }
+
   if (thread) {
     prev_priority = thread->QueryPriority();
     thread->SetPriority(increment);
@@ -246,15 +276,15 @@ SHIM_CALL KeSetBasePriorityThread_shim(PPCContext* ppc_state,
   SHIM_SET_RETURN_32(prev_priority);
 }
 
-SHIM_CALL KeSetDisableBoostThread_shim(PPCContext* ppc_state,
-                                       KernelState* state) {
+SHIM_CALL KeSetDisableBoostThread_shim(PPCContext* ppc_context,
+                                       KernelState* kernel_state) {
   uint32_t thread_ptr = SHIM_GET_ARG_32(0);
   uint32_t disabled = SHIM_GET_ARG_32(1);
 
   XELOGD("KeSetDisableBoostThread(%.8X, %.8X)", thread_ptr, disabled);
 
-  XThread* thread =
-      (XThread*)XObject::GetObject(state, SHIM_MEM_ADDR(thread_ptr));
+  auto thread = XObject::GetNativeObject<XThread>(kernel_state,
+                                                  SHIM_MEM_ADDR(thread_ptr));
   if (thread) {
     // Uhm?
   }
@@ -262,45 +292,39 @@ SHIM_CALL KeSetDisableBoostThread_shim(PPCContext* ppc_state,
   SHIM_SET_RETURN_32(0);
 }
 
-SHIM_CALL KeGetCurrentProcessType_shim(PPCContext* ppc_state,
-                                       KernelState* state) {
+SHIM_CALL KeGetCurrentProcessType_shim(PPCContext* ppc_context,
+                                       KernelState* kernel_state) {
   // XELOGD(
   //     "KeGetCurrentProcessType()");
 
   // DWORD
 
-  SHIM_SET_RETURN_64(state->process_type());
+  SHIM_SET_RETURN_32(kernel_state->process_type());
 }
 
-SHIM_CALL KeSetCurrentProcessType_shim(PPCContext* ppc_state,
-                                       KernelState* state) {
+SHIM_CALL KeSetCurrentProcessType_shim(PPCContext* ppc_context,
+                                       KernelState* kernel_state) {
   uint32_t type = SHIM_GET_ARG_32(0);
   // One of X_PROCTYPE_?
 
   XELOGD("KeSetCurrentProcessType(%d)", type);
 
-  assert_true(type >= 0 && type <= 2);
+  assert_true(type <= 2);
 
-  state->set_process_type(type);
+  kernel_state->set_process_type(type);
 }
 
-SHIM_CALL KeQueryPerformanceFrequency_shim(PPCContext* ppc_state,
-                                           KernelState* state) {
+SHIM_CALL KeQueryPerformanceFrequency_shim(PPCContext* ppc_context,
+                                           KernelState* kernel_state) {
   // XELOGD(
   //     "KeQueryPerformanceFrequency()");
 
-  // TODO(benvanik): return fixed 50000000?
-
-  uint64_t result = 0;
-  LARGE_INTEGER frequency;
-  if (QueryPerformanceFrequency(&frequency)) {
-    result = frequency.QuadPart;
-  }
-  SHIM_SET_RETURN_64(result);
+  uint64_t result = Clock::guest_tick_frequency();
+  SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL KeDelayExecutionThread_shim(PPCContext* ppc_state,
-                                      KernelState* state) {
+SHIM_CALL KeDelayExecutionThread_shim(PPCContext* ppc_context,
+                                      KernelState* kernel_state) {
   uint32_t processor_mode = SHIM_GET_ARG_32(0);
   uint32_t alertable = SHIM_GET_ARG_32(1);
   uint32_t interval_ptr = SHIM_GET_ARG_32(2);
@@ -316,22 +340,21 @@ SHIM_CALL KeDelayExecutionThread_shim(PPCContext* ppc_state,
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtYieldExecution_shim(PPCContext* ppc_state, KernelState* state) {
-  //XELOGD("NtYieldExecution()");
-  XThread* thread = XThread::GetCurrentThread();
-  X_STATUS result = thread->Delay(0, 0, 0);
-  SHIM_SET_RETURN_64(0);
+SHIM_CALL NtYieldExecution_shim(PPCContext* ppc_context,
+                                KernelState* kernel_state) {
+  // XELOGD("NtYieldExecution()");
+  auto thread = XThread::GetCurrentThread();
+  thread->Delay(0, 0, 0);
+  SHIM_SET_RETURN_32(0);
 }
 
-SHIM_CALL KeQuerySystemTime_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeQuerySystemTime_shim(PPCContext* ppc_context,
+                                 KernelState* kernel_state) {
   uint32_t time_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("KeQuerySystemTime(%.8X)", time_ptr);
 
-  FILETIME t;
-  GetSystemTimeAsFileTime(&t);
-  uint64_t time = ((uint64_t)t.dwHighDateTime << 32) | t.dwLowDateTime;
-
+  uint64_t time = Clock::QueryGuestSystemTime();
   if (time_ptr) {
     SHIM_SET_MEM_64(time_ptr, time);
   }
@@ -343,49 +366,35 @@ SHIM_CALL KeQuerySystemTime_shim(PPCContext* ppc_state, KernelState* state) {
 // hoping for the best.
 
 // http://msdn.microsoft.com/en-us/library/ms686801
-SHIM_CALL KeTlsAlloc_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeTlsAlloc_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   XELOGD("KeTlsAlloc()");
 
-  uint32_t tls_index;
-
-#if XE_PLATFORM_WIN32
-  tls_index = TlsAlloc();
-#else
-  pthread_key_t key;
-  if (pthread_key_create(&key, NULL)) {
+  auto tls_index = xe::threading::AllocateTlsHandle();
+  if (tls_index == xe::threading::kInvalidTlsHandle) {
     tls_index = X_TLS_OUT_OF_INDEXES;
-  } else {
-    tls_index = (uint32_t)key;
   }
-#endif  // WIN32
 
-  SHIM_SET_RETURN_64(tls_index);
+  SHIM_SET_RETURN_32(tls_index);
 }
 
 // http://msdn.microsoft.com/en-us/library/ms686804
-SHIM_CALL KeTlsFree_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeTlsFree_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   uint32_t tls_index = SHIM_GET_ARG_32(0);
 
   XELOGD("KeTlsFree(%.8X)", tls_index);
 
   if (tls_index == X_TLS_OUT_OF_INDEXES) {
-    SHIM_SET_RETURN_64(0);
+    SHIM_SET_RETURN_32(0);
     return;
   }
 
-  int result = 0;
-
-#if XE_PLATFORM_WIN32
-  result = TlsFree(tls_index);
-#else
-  result = pthread_key_delete(tls_index) == 0;
-#endif  // WIN32
-
-  SHIM_SET_RETURN_64(result);
+  uint32_t result = xe::threading::FreeTlsHandle(tls_index) ? 1 : 0;
+  SHIM_SET_RETURN_32(result);
 }
 
 // http://msdn.microsoft.com/en-us/library/ms686812
-SHIM_CALL KeTlsGetValue_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeTlsGetValue_shim(PPCContext* ppc_context,
+                             KernelState* kernel_state) {
   uint32_t tls_index = SHIM_GET_ARG_32(0);
 
   // Logging disabled, as some games spam this.
@@ -393,42 +402,88 @@ SHIM_CALL KeTlsGetValue_shim(PPCContext* ppc_state, KernelState* state) {
   //    "KeTlsGetValue(%.8X)",
   //    tls_index);
 
-  uint64_t value = 0;
-
-#if XE_PLATFORM_WIN32
-  value = (uint64_t)TlsGetValue(tls_index);
-#else
-  value = (uint64_t)pthread_getspecific(tls_index);
-#endif  // WIN32
-
+  uint32_t value = static_cast<uint32_t>(xe::threading::GetTlsValue(tls_index));
   if (!value) {
     // XELOGW("KeTlsGetValue should SetLastError if result is NULL");
-    // TODO(benvanik): SetLastError
+    // TODO(benvanik): SetLastError? Or does user code do this?
   }
 
-  SHIM_SET_RETURN_64(value);
+  SHIM_SET_RETURN_32(value);
 }
 
 // http://msdn.microsoft.com/en-us/library/ms686818
-SHIM_CALL KeTlsSetValue_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeTlsSetValue_shim(PPCContext* ppc_context,
+                             KernelState* kernel_state) {
   uint32_t tls_index = SHIM_GET_ARG_32(0);
   uint32_t tls_value = SHIM_GET_ARG_32(1);
 
   XELOGD("KeTlsSetValue(%.8X, %.8X)", tls_index, tls_value);
 
-  int result = 0;
-
-#if XE_PLATFORM_WIN32
-  result = TlsSetValue(
-      tls_index, reinterpret_cast<LPVOID>(static_cast<uintptr_t>(tls_value)));
-#else
-  result = pthread_setspecific(tls_index, (void*)tls_value) == 0;
-#endif  // WIN32
-
-  SHIM_SET_RETURN_64(result);
+  uint32_t result = xe::threading::SetTlsValue(tls_index, tls_value) ? 1 : 0;
+  SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtCreateEvent_shim(PPCContext* ppc_state, KernelState* state) {
+dword_result_t KeInitializeEvent(pointer_t<X_KEVENT> event_ptr,
+                                 dword_t event_type, dword_t initial_state) {
+  event_ptr.Zero();
+  event_ptr->header.type = event_type;
+  event_ptr->header.signal_state = (uint32_t)initial_state;
+  auto ev =
+      XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr, event_type);
+  if (!ev) {
+    return X_STATUS_INSUFFICIENT_RESOURCES;
+  }
+
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT(KeInitializeEvent,
+                        ExportTag::kImplemented | ExportTag::kThreading);
+
+dword_result_t KeSetEvent(pointer_t<X_KEVENT> event_ptr, dword_t increment,
+                          dword_t wait) {
+  // Update dispatch header
+  xe::atomic_exchange(xe::byte_swap<uint32_t>(1),
+                      (uint32_t*)&event_ptr->header.signal_state);
+
+  auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr);
+  if (!ev) {
+    assert_always();
+    return 0;
+  }
+
+  return ev->Set(increment, !!wait);
+}
+DECLARE_XBOXKRNL_EXPORT(KeSetEvent,
+                        ExportTag::kImplemented | ExportTag::kThreading);
+
+dword_result_t KePulseEvent(pointer_t<X_KEVENT> event_ptr, dword_t increment,
+                            dword_t wait) {
+  auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr);
+  if (!ev) {
+    assert_always();
+    return 0;
+  }
+
+  return ev->Pulse(increment, !!wait);
+}
+DECLARE_XBOXKRNL_EXPORT(KePulseEvent, ExportTag::kImplemented);
+
+dword_result_t KeResetEvent(pointer_t<X_KEVENT> event_ptr) {
+  // Update dispatch header
+  xe::atomic_exchange(0, (uint32_t*)&event_ptr->header.signal_state);
+
+  auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr);
+  if (!ev) {
+    return 0;
+  }
+
+  return ev->Reset();
+}
+DECLARE_XBOXKRNL_EXPORT(KeResetEvent,
+                        ExportTag::kImplemented | ExportTag::kThreading);
+
+SHIM_CALL NtCreateEvent_shim(PPCContext* ppc_context,
+                             KernelState* kernel_state) {
   uint32_t handle_ptr = SHIM_GET_ARG_32(0);
   uint32_t obj_attributes_ptr = SHIM_GET_ARG_32(1);
   uint32_t event_type = SHIM_GET_ARG_32(2);
@@ -439,16 +494,14 @@ SHIM_CALL NtCreateEvent_shim(PPCContext* ppc_state, KernelState* state) {
 
   // TODO(benvanik): check for name collision. May return existing object if
   // type matches.
-  if (obj_attributes_ptr) {
-    AssertNoNameCollision(state, obj_attributes_ptr);
-  }
+  AssertNoNameCollision(kernel_state, obj_attributes_ptr);
 
-  XEvent* ev = new XEvent(state);
+  XEvent* ev = new XEvent(kernel_state);
   ev->Initialize(!event_type, !!initial_state);
 
   // obj_attributes may have a name inside of it, if != NULL.
   if (obj_attributes_ptr) {
-    ev->SetAttributes(SHIM_MEM_ADDR(obj_attributes_ptr));
+    ev->SetAttributes(obj_attributes_ptr);
   }
 
   if (handle_ptr) {
@@ -457,27 +510,7 @@ SHIM_CALL NtCreateEvent_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(X_STATUS_SUCCESS);
 }
 
-SHIM_CALL KeSetEvent_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t event_ref = SHIM_GET_ARG_32(0);
-  uint32_t increment = SHIM_GET_ARG_32(1);
-  uint32_t wait = SHIM_GET_ARG_32(2);
-
-  XELOGD("KeSetEvent(%.8X, %.8X, %.8X)", event_ref, increment, wait);
-
-  void* event_ptr = SHIM_MEM_ADDR(event_ref);
-
-  XEvent* ev = (XEvent*)XObject::GetObject(state, event_ptr);
-  assert_not_null(ev);
-  if (!ev) {
-    SHIM_SET_RETURN_64(0);
-    return;
-  }
-
-  auto result = ev->Set(increment, !!wait);
-  SHIM_SET_RETURN_64(result);
-}
-
-SHIM_CALL NtSetEvent_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtSetEvent_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   uint32_t event_handle = SHIM_GET_ARG_32(0);
   uint32_t previous_state_ptr = SHIM_GET_ARG_32(1);
 
@@ -485,40 +518,21 @@ SHIM_CALL NtSetEvent_shim(PPCContext* ppc_state, KernelState* state) {
 
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XEvent* ev = NULL;
-  result = state->object_table()->GetObject(event_handle, (XObject**)&ev);
-  if (XSUCCEEDED(result)) {
+  auto ev = kernel_state->object_table()->LookupObject<XEvent>(event_handle);
+  if (ev) {
     int32_t was_signalled = ev->Set(0, false);
     if (previous_state_ptr) {
       SHIM_SET_MEM_32(previous_state_ptr, was_signalled);
     }
-
-    ev->Release();
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL KePulseEvent_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t event_ref = SHIM_GET_ARG_32(0);
-  uint32_t increment = SHIM_GET_ARG_32(1);
-  uint32_t wait = SHIM_GET_ARG_32(2);
-
-  XELOGD("KePulseEvent(%.8X, %.8X, %.8X)", event_ref, increment, wait);
-
-  int32_t result = 0;
-
-  void* event_ptr = SHIM_MEM_ADDR(event_ref);
-  XEvent* ev = (XEvent*)XObject::GetObject(state, event_ptr);
-  assert_not_null(ev);
-  if (ev) {
-    result = ev->Pulse(increment, !!wait);
-  }
-
-  SHIM_SET_RETURN_64(result);
-}
-
-SHIM_CALL NtPulseEvent_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtPulseEvent_shim(PPCContext* ppc_context,
+                            KernelState* kernel_state) {
   uint32_t event_handle = SHIM_GET_ARG_32(0);
   uint32_t previous_state_ptr = SHIM_GET_ARG_32(1);
 
@@ -526,55 +540,71 @@ SHIM_CALL NtPulseEvent_shim(PPCContext* ppc_state, KernelState* state) {
 
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XEvent* ev = NULL;
-  result = state->object_table()->GetObject(event_handle, (XObject**)&ev);
-  if (XSUCCEEDED(result)) {
+  auto ev = kernel_state->object_table()->LookupObject<XEvent>(event_handle);
+  if (ev) {
     int32_t was_signalled = ev->Pulse(0, false);
     if (previous_state_ptr) {
       SHIM_SET_MEM_32(previous_state_ptr, was_signalled);
     }
-
-    ev->Release();
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL KeResetEvent_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t event_ref = SHIM_GET_ARG_32(0);
-
-  XELOGD("KeResetEvent(%.8X)", event_ref);
-
-  void* event_ptr = SHIM_MEM_ADDR(event_ref);
-  XEvent* ev = (XEvent*)XEvent::GetObject(state, event_ptr);
-  assert_not_null(ev);
-  if (!ev) {
-    SHIM_SET_RETURN_64(0);
-    return;
-  }
-
-  auto result = ev->Reset();
-  SHIM_SET_RETURN_64(result);
-}
-
-SHIM_CALL NtClearEvent_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t event_handle = SHIM_GET_ARG_32(0);
-
-  XELOGD("NtClearEvent(%.8X)", event_handle);
-
+dword_result_t NtClearEvent(dword_t handle) {
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XEvent* ev = NULL;
-  result = state->object_table()->GetObject(event_handle, (XObject**)&ev);
-  if (XSUCCEEDED(result)) {
+  auto ev = kernel_state()->object_table()->LookupObject<XEvent>(handle);
+  if (ev) {
     ev->Reset();
-    ev->Release();
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
-  SHIM_SET_RETURN_32(result);
+  return result;
 }
+DECLARE_XBOXKRNL_EXPORT(NtClearEvent,
+                        ExportTag::kImplemented | ExportTag::kThreading);
 
-SHIM_CALL NtCreateSemaphore_shim(PPCContext* ppc_state, KernelState* state) {
+// https://msdn.microsoft.com/en-us/library/windows/hardware/ff552150(v=vs.85).aspx
+void KeInitializeSemaphore(pointer_t<X_KSEMAPHORE> semaphore_ptr, dword_t count,
+                           dword_t limit) {
+  semaphore_ptr->header.type = 5;  // SemaphoreObject
+  semaphore_ptr->header.signal_state = (uint32_t)count;
+  semaphore_ptr->limit = (uint32_t)limit;
+
+  auto sem = XObject::GetNativeObject<XSemaphore>(kernel_state(), semaphore_ptr,
+                                                  5 /* SemaphoreObject */);
+  if (!sem) {
+    assert_always();
+    return;
+  }
+}
+DECLARE_XBOXKRNL_EXPORT(KeInitializeSemaphore,
+                        ExportTag::kImplemented | ExportTag::kThreading);
+
+dword_result_t KeReleaseSemaphore(pointer_t<X_KSEMAPHORE> semaphore_ptr,
+                                  dword_t increment, dword_t adjustment,
+                                  dword_t wait) {
+  auto sem =
+      XObject::GetNativeObject<XSemaphore>(kernel_state(), semaphore_ptr);
+  if (!sem) {
+    assert_always();
+    return 0;
+  }
+
+  // TODO(benvanik): increment thread priority?
+  // TODO(benvanik): wait?
+
+  return sem->ReleaseSemaphore(adjustment);
+}
+DECLARE_XBOXKRNL_EXPORT(KeReleaseSemaphore,
+                        ExportTag::kImplemented | ExportTag::kThreading);
+
+SHIM_CALL NtCreateSemaphore_shim(PPCContext* ppc_context,
+                                 KernelState* kernel_state) {
   uint32_t handle_ptr = SHIM_GET_ARG_32(0);
   uint32_t obj_attributes_ptr = SHIM_GET_ARG_32(1);
   int32_t count = SHIM_GET_ARG_32(2);
@@ -585,14 +615,16 @@ SHIM_CALL NtCreateSemaphore_shim(PPCContext* ppc_state, KernelState* state) {
 
   // TODO(benvanik): check for name collision. May return existing object if
   // type matches.
-  AssertNoNameCollision(state, obj_attributes_ptr);
+  if (obj_attributes_ptr) {
+    AssertNoNameCollision(kernel_state, obj_attributes_ptr);
+  }
 
-  XSemaphore* sem = new XSemaphore(state);
+  auto sem = object_ref<XSemaphore>(new XSemaphore(kernel_state));
   sem->Initialize(count, limit);
 
   // obj_attributes may have a name inside of it, if != NULL.
   if (obj_attributes_ptr) {
-    sem->SetAttributes(SHIM_MEM_ADDR(obj_attributes_ptr));
+    sem->SetAttributes(obj_attributes_ptr);
   }
 
   if (handle_ptr) {
@@ -602,50 +634,8 @@ SHIM_CALL NtCreateSemaphore_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(X_STATUS_SUCCESS);
 }
 
-SHIM_CALL KeInitializeSemaphore_shim(PPCContext* ppc_state,
-                                     KernelState* state) {
-  uint32_t semaphore_ref = SHIM_GET_ARG_32(0);
-  int32_t count = SHIM_GET_ARG_32(1);
-  int32_t limit = SHIM_GET_ARG_32(2);
-
-  XELOGD("KeInitializeSemaphore(%.8X, %d, %d)", semaphore_ref, count, limit);
-
-  void* semaphore_ptr = SHIM_MEM_ADDR(semaphore_ref);
-  XSemaphore* sem = (XSemaphore*)XSemaphore::GetObject(state, semaphore_ptr,
-                                                       5 /* SemaphoreObject */);
-  assert_not_null(sem);
-  if (!sem) {
-    return;
-  }
-
-  sem->Initialize(count, limit);
-}
-
-SHIM_CALL KeReleaseSemaphore_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t semaphore_ref = SHIM_GET_ARG_32(0);
-  int32_t increment = SHIM_GET_ARG_32(1);
-  int32_t adjustment = SHIM_GET_ARG_32(2);
-  int32_t wait = SHIM_GET_ARG_32(3);
-
-  XELOGD("KeReleaseSemaphore(%.8X, %d, %d, %d)", semaphore_ref, increment,
-         adjustment, wait);
-
-  void* semaphore_ptr = SHIM_MEM_ADDR(semaphore_ref);
-  XSemaphore* sem = (XSemaphore*)XSemaphore::GetObject(state, semaphore_ptr);
-  assert_not_null(sem);
-  if (!sem) {
-    SHIM_SET_RETURN_64(0);
-    return;
-  }
-
-  // TODO(benvanik): increment thread priority?
-  // TODO(benvanik): wait?
-
-  int32_t result = sem->ReleaseSemaphore(adjustment);
-  SHIM_SET_RETURN_64(result);
-}
-
-SHIM_CALL NtReleaseSemaphore_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtReleaseSemaphore_shim(PPCContext* ppc_context,
+                                  KernelState* kernel_state) {
   uint32_t sem_handle = SHIM_GET_ARG_32(0);
   int32_t release_count = SHIM_GET_ARG_32(1);
   int32_t previous_count_ptr = SHIM_GET_ARG_32(2);
@@ -654,49 +644,48 @@ SHIM_CALL NtReleaseSemaphore_shim(PPCContext* ppc_state, KernelState* state) {
          previous_count_ptr);
 
   X_STATUS result = X_STATUS_SUCCESS;
+  int32_t previous_count = 0;
 
-  XSemaphore* sem = NULL;
-  result = state->object_table()->GetObject(sem_handle, (XObject**)&sem);
-  if (XSUCCEEDED(result)) {
-    int32_t previous_count = sem->ReleaseSemaphore(release_count);
-    sem->Release();
-
-    if (previous_count_ptr) {
-      SHIM_SET_MEM_32(previous_count_ptr, previous_count);
-    }
+  auto sem = kernel_state->object_table()->LookupObject<XSemaphore>(sem_handle);
+  if (sem) {
+    previous_count = sem->ReleaseSemaphore(release_count);
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+  if (previous_count_ptr) {
+    SHIM_SET_MEM_32(previous_count_ptr, previous_count);
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtCreateMutant_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t handle_ptr = SHIM_GET_ARG_32(0);
-  uint32_t obj_attributes_ptr = SHIM_GET_ARG_32(1);
-  uint32_t initial_owner = SHIM_GET_ARG_32(2);
-
-  XELOGD("NtCreateMutant(%.8X, %.8X, %.1X)", handle_ptr, obj_attributes_ptr,
-         initial_owner);
-
+dword_result_t NtCreateMutant(lpdword_t handle_out,
+                              pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes,
+                              dword_t initial_owner) {
   // TODO(benvanik): check for name collision. May return existing object if
   // type matches.
-  AssertNoNameCollision(state, obj_attributes_ptr);
+  if (obj_attributes) {
+    AssertNoNameCollision(kernel_state(), obj_attributes);
+  }
 
-  XMutant* mutant = new XMutant(state);
+  XMutant* mutant = new XMutant(kernel_state());
   mutant->Initialize(initial_owner ? true : false);
 
   // obj_attributes may have a name inside of it, if != NULL.
-  if (obj_attributes_ptr) {
-    mutant->SetAttributes(SHIM_MEM_ADDR(obj_attributes_ptr));
+  if (obj_attributes) {
+    mutant->SetAttributes(obj_attributes);
   }
 
-  if (handle_ptr) {
-    SHIM_SET_MEM_32(handle_ptr, mutant->handle());
+  if (handle_out) {
+    *handle_out = mutant->handle();
   }
 
-  SHIM_SET_RETURN_32(X_STATUS_SUCCESS);
+  return X_STATUS_SUCCESS;
 }
+DECLARE_XBOXKRNL_EXPORT(NtCreateMutant, ExportTag::kImplemented);
 
-SHIM_CALL NtReleaseMutant_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtReleaseMutant_shim(PPCContext* ppc_context,
+                               KernelState* kernel_state) {
   uint32_t mutant_handle = SHIM_GET_ARG_32(0);
   int32_t unknown = SHIM_GET_ARG_32(1);
   // This doesn't seem to be supported.
@@ -714,17 +703,19 @@ SHIM_CALL NtReleaseMutant_shim(PPCContext* ppc_state, KernelState* state) {
 
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XMutant* mutant = NULL;
-  result = state->object_table()->GetObject(mutant_handle, (XObject**)&mutant);
-  if (XSUCCEEDED(result)) {
+  auto mutant =
+      kernel_state->object_table()->LookupObject<XMutant>(mutant_handle);
+  if (mutant) {
     result = mutant->ReleaseMutant(priority_increment, abandon, wait);
-    mutant->Release();
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtCreateTimer_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtCreateTimer_shim(PPCContext* ppc_context,
+                             KernelState* kernel_state) {
   uint32_t handle_ptr = SHIM_GET_ARG_32(0);
   uint32_t obj_attributes_ptr = SHIM_GET_ARG_32(1);
   uint32_t timer_type = SHIM_GET_ARG_32(2);
@@ -736,14 +727,16 @@ SHIM_CALL NtCreateTimer_shim(PPCContext* ppc_state, KernelState* state) {
 
   // TODO(benvanik): check for name collision. May return existing object if
   // type matches.
-  AssertNoNameCollision(state, obj_attributes_ptr);
+  if (obj_attributes_ptr) {
+    AssertNoNameCollision(kernel_state, obj_attributes_ptr);
+  }
 
-  XTimer* timer = new XTimer(state);
+  XTimer* timer = new XTimer(kernel_state);
   timer->Initialize(timer_type);
 
   // obj_attributes may have a name inside of it, if != NULL.
   if (obj_attributes_ptr) {
-    timer->SetAttributes(SHIM_MEM_ADDR(obj_attributes_ptr));
+    timer->SetAttributes(obj_attributes_ptr);
   }
 
   if (handle_ptr) {
@@ -753,7 +746,8 @@ SHIM_CALL NtCreateTimer_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(X_STATUS_SUCCESS);
 }
 
-SHIM_CALL NtSetTimerEx_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtSetTimerEx_shim(PPCContext* ppc_context,
+                            KernelState* kernel_state) {
   uint32_t timer_handle = SHIM_GET_ARG_32(0);
   uint32_t due_time_ptr = SHIM_GET_ARG_32(1);
   uint32_t routine = SHIM_GET_ARG_32(2);  // PTIMERAPCROUTINE
@@ -774,18 +768,19 @@ SHIM_CALL NtSetTimerEx_shim(PPCContext* ppc_state, KernelState* state) {
 
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XTimer* timer = NULL;
-  result = state->object_table()->GetObject(timer_handle, (XObject**)&timer);
-  if (XSUCCEEDED(result)) {
+  auto timer = kernel_state->object_table()->LookupObject<XTimer>(timer_handle);
+  if (timer) {
     result = timer->SetTimer(due_time, period_ms, routine, routine_arg,
                              resume ? true : false);
-    timer->Release();
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtCancelTimer_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtCancelTimer_shim(PPCContext* ppc_context,
+                             KernelState* kernel_state) {
   uint32_t timer_handle = SHIM_GET_ARG_32(0);
   uint32_t current_state_ptr = SHIM_GET_ARG_32(1);
 
@@ -793,22 +788,21 @@ SHIM_CALL NtCancelTimer_shim(PPCContext* ppc_state, KernelState* state) {
 
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XTimer* timer = NULL;
-  result = state->object_table()->GetObject(timer_handle, (XObject**)&timer);
-  if (XSUCCEEDED(result)) {
+  auto timer = kernel_state->object_table()->LookupObject<XTimer>(timer_handle);
+  if (timer) {
     result = timer->Cancel();
-    timer->Release();
-
-    if (current_state_ptr) {
-      SHIM_SET_MEM_32(current_state_ptr, 0);
-    }
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
+  }
+  if (current_state_ptr) {
+    SHIM_SET_MEM_32(current_state_ptr, 0);
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL KeWaitForSingleObject_shim(PPCContext* ppc_state,
-                                     KernelState* state) {
+SHIM_CALL KeWaitForSingleObject_shim(PPCContext* ppc_context,
+                                     KernelState* kernel_state) {
   uint32_t object_ptr = SHIM_GET_ARG_32(0);
   uint32_t wait_reason = SHIM_GET_ARG_32(1);
   uint32_t processor_mode = SHIM_GET_ARG_32(2);
@@ -818,7 +812,18 @@ SHIM_CALL KeWaitForSingleObject_shim(PPCContext* ppc_state,
   XELOGD("KeWaitForSingleObject(%.8X, %.8X, %.8X, %.1X, %.8X)", object_ptr,
          wait_reason, processor_mode, alertable, timeout_ptr);
 
-  XObject* object = XObject::GetObject(state, SHIM_MEM_ADDR(object_ptr));
+  object_ref<XObject> object;
+  if (object_ptr < 0x1000) {
+    // They passed in a handle (for some reason)
+    object = kernel_state->object_table()->LookupObject<XObject>(object_ptr);
+
+    // Log it in case this is the source of any problems in the future
+    XELOGD("KeWaitForSingleObject - Interpreting object ptr as handle!");
+  } else {
+    object = XObject::GetNativeObject<XObject>(kernel_state,
+                                               SHIM_MEM_ADDR(object_ptr));
+  }
+
   if (!object) {
     // The only kind-of failure code.
     SHIM_SET_RETURN_32(X_STATUS_ABANDONED_WAIT_0);
@@ -832,8 +837,8 @@ SHIM_CALL KeWaitForSingleObject_shim(PPCContext* ppc_state,
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtWaitForSingleObjectEx_shim(PPCContext* ppc_state,
-                                       KernelState* state) {
+SHIM_CALL NtWaitForSingleObjectEx_shim(PPCContext* ppc_context,
+                                       KernelState* kernel_state) {
   uint32_t object_handle = SHIM_GET_ARG_32(0);
   uint8_t wait_mode = SHIM_GET_ARG_8(1);
   uint32_t alertable = SHIM_GET_ARG_32(2);
@@ -844,20 +849,21 @@ SHIM_CALL NtWaitForSingleObjectEx_shim(PPCContext* ppc_state,
 
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XObject* object = NULL;
-  result = state->object_table()->GetObject(object_handle, &object);
-  if (XSUCCEEDED(result)) {
+  auto object =
+      kernel_state->object_table()->LookupObject<XObject>(object_handle);
+  if (object) {
     uint64_t timeout = timeout_ptr ? SHIM_MEM_64(timeout_ptr) : 0;
     result =
-        object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : NULL);
-    object->Release();
+        object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL KeWaitForMultipleObjects_shim(PPCContext* ppc_state,
-                                        KernelState* state) {
+SHIM_CALL KeWaitForMultipleObjects_shim(PPCContext* ppc_context,
+                                        KernelState* kernel_state) {
   uint32_t count = SHIM_GET_ARG_32(0);
   uint32_t objects_ptr = SHIM_GET_ARG_32(1);
   uint32_t wait_type = SHIM_GET_ARG_32(2);
@@ -872,66 +878,62 @@ SHIM_CALL KeWaitForMultipleObjects_shim(PPCContext* ppc_state,
       count, objects_ptr, wait_type, wait_reason, processor_mode, alertable,
       timeout_ptr, wait_block_array_ptr);
 
-  assert_true(wait_type >= 0 && wait_type <= 1);
+  assert_true(wait_type <= 1);
 
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XObject** objects = (XObject**)alloca(sizeof(XObject*) * count);
+  std::vector<object_ref<XObject>> objects;
   for (uint32_t n = 0; n < count; n++) {
     uint32_t object_ptr_ptr = SHIM_MEM_32(objects_ptr + n * 4);
     void* object_ptr = SHIM_MEM_ADDR(object_ptr_ptr);
-    objects[n] = XObject::GetObject(state, object_ptr);
-    if (!objects[n]) {
+    auto object_ref =
+        XObject::GetNativeObject<XObject>(kernel_state, object_ptr);
+    if (!object_ref) {
       SHIM_SET_RETURN_32(X_STATUS_INVALID_PARAMETER);
       return;
     }
+    objects.push_back(std::move(object_ref));
   }
 
   uint64_t timeout = timeout_ptr ? SHIM_MEM_64(timeout_ptr) : 0;
-  result = XObject::WaitMultiple(count, objects, wait_type, wait_reason,
-                                 processor_mode, alertable,
-                                 timeout_ptr ? &timeout : NULL);
+  result = XObject::WaitMultiple(uint32_t(objects.size()),
+                                 reinterpret_cast<XObject**>(objects.data()),
+                                 wait_type, wait_reason, processor_mode,
+                                 alertable, timeout_ptr ? &timeout : nullptr);
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL NtWaitForMultipleObjectsEx_shim(PPCContext* ppc_state,
-                                          KernelState* state) {
-  uint32_t count = SHIM_GET_ARG_32(0);
-  uint32_t handles_ptr = SHIM_GET_ARG_32(1);
-  uint32_t wait_type = SHIM_GET_ARG_32(2);
-  uint8_t wait_mode = SHIM_GET_ARG_8(3);
-  uint32_t alertable = SHIM_GET_ARG_32(4);
-  uint32_t timeout_ptr = SHIM_GET_ARG_32(5);
-
-  XELOGD("NtWaitForMultipleObjectsEx(%d, %.8X, %.8X, %.8X, %.8X, %.8X)", count,
-         handles_ptr, wait_type, wait_mode, alertable, timeout_ptr);
-
-  assert_true(wait_type >= 0 && wait_type <= 1);
-
+dword_result_t NtWaitForMultipleObjectsEx(
+    dword_t count, pointer_t<xe::be<uint32_t>> handles, dword_t wait_type,
+    dword_t wait_mode, dword_t alertable,
+    pointer_t<xe::be<uint64_t>> timeout_ptr) {
+  assert_true(wait_type <= 1);
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XObject** objects = (XObject**)alloca(sizeof(XObject*) * count);
+  std::vector<object_ref<XObject>> objects(count);
   for (uint32_t n = 0; n < count; n++) {
-    uint32_t object_handle = SHIM_MEM_32(handles_ptr + n * 4);
-    XObject* object = NULL;
-    result = state->object_table()->GetObject(object_handle, &object);
-    if (XFAILED(result)) {
-      SHIM_SET_RETURN_32(X_STATUS_INVALID_PARAMETER);
-      return;
+    uint32_t object_handle = handles[n];
+    auto object =
+        kernel_state()->object_table()->LookupObject<XObject>(object_handle);
+    if (!object) {
+      return X_STATUS_INVALID_PARAMETER;
     }
-    objects[n] = object;
+    objects[n] = std::move(object);
   }
 
-  uint64_t timeout = timeout_ptr ? SHIM_MEM_64(timeout_ptr) : 0;
-  result = XObject::WaitMultiple(count, objects, wait_type, 6, wait_mode,
-                                 alertable, timeout_ptr ? &timeout : NULL);
+  uint64_t timeout = timeout_ptr ? uint64_t(*timeout_ptr) : 0;
+  result = XObject::WaitMultiple(
+      count, reinterpret_cast<XObject**>(objects.data()), wait_type, 6,
+      wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
 
-  SHIM_SET_RETURN_32(result);
+  return result;
 }
+DECLARE_XBOXKRNL_EXPORT(NtWaitForMultipleObjectsEx,
+                        ExportTag::kImplemented | ExportTag::kThreading);
 
-SHIM_CALL NtSignalAndWaitForSingleObjectEx_shim(PPCContext* ppc_state,
-                                                KernelState* state) {
+SHIM_CALL NtSignalAndWaitForSingleObjectEx_shim(PPCContext* ppc_context,
+                                                KernelState* kernel_state) {
   uint32_t signal_handle = SHIM_GET_ARG_32(0);
   uint32_t wait_handle = SHIM_GET_ARG_32(1);
   uint32_t alertable = SHIM_GET_ARG_32(2);
@@ -943,28 +945,24 @@ SHIM_CALL NtSignalAndWaitForSingleObjectEx_shim(PPCContext* ppc_state,
 
   X_STATUS result = X_STATUS_SUCCESS;
 
-  XObject* signal_object = NULL;
-  XObject* wait_object = NULL;
-  result = state->object_table()->GetObject(signal_handle, &signal_object);
-  if (XSUCCEEDED(result)) {
-    result = state->object_table()->GetObject(wait_handle, &wait_object);
-  }
-  if (XSUCCEEDED(result)) {
+  auto signal_object =
+      kernel_state->object_table()->LookupObject<XObject>(signal_handle);
+  auto wait_object =
+      kernel_state->object_table()->LookupObject<XObject>(wait_handle);
+  if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? SHIM_MEM_64(timeout_ptr) : 0;
-    result = XObject::SignalAndWait(signal_object, wait_object, 3, 1, alertable,
-                                    timeout_ptr ? &timeout : NULL);
-  }
-  if (signal_object) {
-    signal_object->Release();
-  }
-  if (wait_object) {
-    wait_object->Release();
+    result =
+        XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1,
+                               alertable, timeout_ptr ? &timeout : nullptr);
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL KfAcquireSpinLock_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KfAcquireSpinLock_shim(PPCContext* ppc_context,
+                                 KernelState* kernel_state) {
   uint32_t lock_ptr = SHIM_GET_ARG_32(0);
 
   // XELOGD(
@@ -973,19 +971,21 @@ SHIM_CALL KfAcquireSpinLock_shim(PPCContext* ppc_state, KernelState* state) {
 
   // Lock.
   auto lock = reinterpret_cast<uint32_t*>(SHIM_MEM_ADDR(lock_ptr));
-  while (!poly::atomic_cas(0, 1, lock)) {
+  while (!xe::atomic_cas(0, 1, lock)) {
     // Spin!
     // TODO(benvanik): error on deadlock?
+    xe::threading::MaybeYield();
   }
 
   // Raise IRQL to DISPATCH.
   XThread* thread = XThread::GetCurrentThread();
   auto old_irql = thread->RaiseIrql(2);
 
-  SHIM_SET_RETURN_64(old_irql);
+  SHIM_SET_RETURN_32(old_irql);
 }
 
-SHIM_CALL KfReleaseSpinLock_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KfReleaseSpinLock_shim(PPCContext* ppc_context,
+                                 KernelState* kernel_state) {
   uint32_t lock_ptr = SHIM_GET_ARG_32(0);
   uint32_t old_irql = SHIM_GET_ARG_32(1);
 
@@ -1000,11 +1000,11 @@ SHIM_CALL KfReleaseSpinLock_shim(PPCContext* ppc_state, KernelState* state) {
 
   // Unlock.
   auto lock = reinterpret_cast<uint32_t*>(SHIM_MEM_ADDR(lock_ptr));
-  poly::atomic_dec(lock);
+  xe::atomic_dec(lock);
 }
 
-SHIM_CALL KeAcquireSpinLockAtRaisedIrql_shim(PPCContext* ppc_state,
-                                             KernelState* state) {
+SHIM_CALL KeAcquireSpinLockAtRaisedIrql_shim(PPCContext* ppc_context,
+                                             KernelState* kernel_state) {
   uint32_t lock_ptr = SHIM_GET_ARG_32(0);
 
   // XELOGD(
@@ -1013,14 +1013,14 @@ SHIM_CALL KeAcquireSpinLockAtRaisedIrql_shim(PPCContext* ppc_state,
 
   // Lock.
   auto lock = reinterpret_cast<uint32_t*>(SHIM_MEM_ADDR(lock_ptr));
-  while (!poly::atomic_cas(0, 1, lock)) {
+  while (!xe::atomic_cas(0, 1, lock)) {
     // Spin!
     // TODO(benvanik): error on deadlock?
   }
 }
 
-SHIM_CALL KeReleaseSpinLockFromRaisedIrql_shim(PPCContext* ppc_state,
-                                               KernelState* state) {
+SHIM_CALL KeReleaseSpinLockFromRaisedIrql_shim(PPCContext* ppc_context,
+                                               KernelState* kernel_state) {
   uint32_t lock_ptr = SHIM_GET_ARG_32(0);
 
   // XELOGD(
@@ -1029,40 +1029,45 @@ SHIM_CALL KeReleaseSpinLockFromRaisedIrql_shim(PPCContext* ppc_state,
 
   // Unlock.
   auto lock = reinterpret_cast<uint32_t*>(SHIM_MEM_ADDR(lock_ptr));
-  poly::atomic_dec(lock);
+  xe::atomic_dec(lock);
 }
 
-SHIM_CALL KeEnterCriticalRegion_shim(PPCContext* ppc_state,
-                                     KernelState* state) {
+SHIM_CALL KeEnterCriticalRegion_shim(PPCContext* ppc_context,
+                                     KernelState* kernel_state) {
   // XELOGD(
   //     "KeEnterCriticalRegion()");
   XThread::EnterCriticalRegion();
 }
 
-SHIM_CALL KeLeaveCriticalRegion_shim(PPCContext* ppc_state,
-                                     KernelState* state) {
+SHIM_CALL KeLeaveCriticalRegion_shim(PPCContext* ppc_context,
+                                     KernelState* kernel_state) {
   // XELOGD(
   //     "KeLeaveCriticalRegion()");
   XThread::LeaveCriticalRegion();
+
+  XThread::GetCurrentThread()->CheckApcs();
 }
 
-SHIM_CALL KeRaiseIrqlToDpcLevel_shim(PPCContext* ppc_state,
-                                     KernelState* state) {
+SHIM_CALL KeRaiseIrqlToDpcLevel_shim(PPCContext* ppc_context,
+                                     KernelState* kernel_state) {
   // XELOGD(
   //     "KeRaiseIrqlToDpcLevel()");
-  auto old_value = state->processor()->RaiseIrql(cpu::Irql::DPC);
+  auto old_value = kernel_state->processor()->RaiseIrql(cpu::Irql::DPC);
   SHIM_SET_RETURN_32(old_value);
 }
 
-SHIM_CALL KfLowerIrql_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KfLowerIrql_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   uint32_t old_value = SHIM_GET_ARG_32(0);
   // XELOGD(
   //     "KfLowerIrql(%d)",
   //     old_value);
-  state->processor()->LowerIrql(static_cast<cpu::Irql>(old_value));
+  kernel_state->processor()->LowerIrql(static_cast<cpu::Irql>(old_value));
+
+  XThread::GetCurrentThread()->CheckApcs();
 }
 
-SHIM_CALL NtQueueApcThread_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL NtQueueApcThread_shim(PPCContext* ppc_context,
+                                KernelState* kernel_state) {
   uint32_t thread_handle = SHIM_GET_ARG_32(0);
   uint32_t apc_routine = SHIM_GET_ARG_32(1);
   uint32_t arg1 = SHIM_GET_ARG_32(2);
@@ -1072,9 +1077,12 @@ SHIM_CALL NtQueueApcThread_shim(PPCContext* ppc_state, KernelState* state) {
          apc_routine, arg1, arg2, arg3);
 
   // Alloc APC object (from somewhere) and insert.
+
+  assert_always("not implemented");
 }
 
-SHIM_CALL KeInitializeApc_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeInitializeApc_shim(PPCContext* ppc_context,
+                               KernelState* kernel_state) {
   uint32_t apc_ptr = SHIM_GET_ARG_32(0);
   uint32_t thread = SHIM_GET_ARG_32(1);
   uint32_t kernel_routine = SHIM_GET_ARG_32(2);
@@ -1087,30 +1095,18 @@ SHIM_CALL KeInitializeApc_shim(PPCContext* ppc_state, KernelState* state) {
          thread, kernel_routine, rundown_routine, normal_routine,
          processor_mode, normal_context);
 
-  // KAPC is 0x28(40) bytes? (what's passed to ExAllocatePoolWithTag)
-  // This is 4b shorter than NT - looks like the reserved dword at +4 is gone
-  uint32_t type = 18;  // ApcObject
-  uint32_t unk0 = 0;
-  uint32_t size = 0x28;
-  uint32_t unk1 = 0;
-  SHIM_SET_MEM_32(apc_ptr + 0,
-                  (type << 24) | (unk0 << 16) | (size << 8) | (unk1));
-  SHIM_SET_MEM_32(apc_ptr + 4, thread);  // known offset - derefed by games
-  SHIM_SET_MEM_32(apc_ptr + 8, 0);       // flink
-  SHIM_SET_MEM_32(apc_ptr + 12, 0);      // blink
-  SHIM_SET_MEM_32(apc_ptr + 16, kernel_routine);
-  SHIM_SET_MEM_32(apc_ptr + 20, rundown_routine);
-  SHIM_SET_MEM_32(apc_ptr + 24, normal_routine);
-  SHIM_SET_MEM_32(apc_ptr + 28, normal_routine ? normal_context : 0);
-  SHIM_SET_MEM_32(apc_ptr + 32, 0);  // arg1
-  SHIM_SET_MEM_32(apc_ptr + 36, 0);  // arg2
-  uint32_t state_index = 0;
-  uint32_t inserted = 0;
-  SHIM_SET_MEM_32(apc_ptr + 40, (state_index << 24) | (processor_mode << 16) |
-                                    (inserted << 8));
+  auto apc = SHIM_STRUCT(XAPC, apc_ptr);
+  apc->Initialize();
+  apc->processor_mode = processor_mode;
+  apc->thread_ptr = thread;
+  apc->kernel_routine = kernel_routine;
+  apc->rundown_routine = rundown_routine;
+  apc->normal_routine = normal_routine;
+  apc->normal_context = normal_routine ? normal_context : 0;
 }
 
-SHIM_CALL KeInsertQueueApc_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeInsertQueueApc_shim(PPCContext* ppc_context,
+                                KernelState* kernel_state) {
   uint32_t apc_ptr = SHIM_GET_ARG_32(0);
   uint32_t arg1 = SHIM_GET_ARG_32(1);
   uint32_t arg2 = SHIM_GET_ARG_32(2);
@@ -1119,11 +1115,12 @@ SHIM_CALL KeInsertQueueApc_shim(PPCContext* ppc_state, KernelState* state) {
   XELOGD("KeInsertQueueApc(%.8X, %.8X, %.8X, %.8X)", apc_ptr, arg1, arg2,
          priority_increment);
 
-  uint32_t thread_ptr = SHIM_MEM_32(apc_ptr + 4);
-  XThread* thread =
-      (XThread*)XObject::GetObject(state, SHIM_MEM_ADDR(thread_ptr));
+  auto apc = SHIM_STRUCT(XAPC, apc_ptr);
+
+  auto thread = XObject::GetNativeObject<XThread>(
+      kernel_state, SHIM_MEM_ADDR(apc->thread_ptr));
   if (!thread) {
-    SHIM_SET_RETURN_64(0);
+    SHIM_SET_RETURN_32(0);
     return;
   }
 
@@ -1131,17 +1128,16 @@ SHIM_CALL KeInsertQueueApc_shim(PPCContext* ppc_state, KernelState* state) {
   thread->LockApc();
 
   // Fail if already inserted.
-  if (SHIM_MEM_32(apc_ptr + 40) & 0xFF00) {
-    thread->UnlockApc();
-    SHIM_SET_RETURN_64(0);
+  if (apc->enqueued) {
+    thread->UnlockApc(false);
+    SHIM_SET_RETURN_32(0);
     return;
   }
 
   // Prep APC.
-  SHIM_SET_MEM_32(apc_ptr + 32, arg1);
-  SHIM_SET_MEM_32(apc_ptr + 36, arg2);
-  SHIM_SET_MEM_32(apc_ptr + 40,
-                  (SHIM_MEM_32(apc_ptr + 40) & ~0xFF00) | (1 << 8));
+  apc->arg1 = arg1;
+  apc->arg2 = arg2;
+  apc->enqueued = 1;
 
   auto apc_list = thread->apc_list();
 
@@ -1149,31 +1145,33 @@ SHIM_CALL KeInsertQueueApc_shim(PPCContext* ppc_state, KernelState* state) {
   apc_list->Insert(list_entry_ptr);
 
   // Unlock thread.
-  thread->UnlockApc();
+  thread->UnlockApc(true);
 
-  SHIM_SET_RETURN_64(1);
+  SHIM_SET_RETURN_32(1);
 }
 
-SHIM_CALL KeRemoveQueueApc_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeRemoveQueueApc_shim(PPCContext* ppc_context,
+                                KernelState* kernel_state) {
   uint32_t apc_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("KeRemoveQueueApc(%.8X)", apc_ptr);
 
   bool result = false;
 
-  uint32_t thread_ptr = SHIM_MEM_32(apc_ptr + 4);
-  XThread* thread =
-      (XThread*)XObject::GetObject(state, SHIM_MEM_ADDR(thread_ptr));
+  auto apc = SHIM_STRUCT(XAPC, apc_ptr);
+
+  auto thread = XObject::GetNativeObject<XThread>(
+      kernel_state, SHIM_MEM_ADDR(apc->thread_ptr));
   if (!thread) {
-    SHIM_SET_RETURN_64(0);
+    SHIM_SET_RETURN_32(0);
     return;
   }
 
   thread->LockApc();
 
-  if (!(SHIM_MEM_32(apc_ptr + 40) & 0xFF00)) {
-    thread->UnlockApc();
-    SHIM_SET_RETURN_64(0);
+  if (!apc->enqueued) {
+    thread->UnlockApc(false);
+    SHIM_SET_RETURN_32(0);
     return;
   }
 
@@ -1184,22 +1182,23 @@ SHIM_CALL KeRemoveQueueApc_shim(PPCContext* ppc_state, KernelState* state) {
     result = true;
   }
 
-  thread->UnlockApc();
+  thread->UnlockApc(true);
 
-  SHIM_SET_RETURN_64(result ? 1 : 0);
+  SHIM_SET_RETURN_32(result ? 1 : 0);
 }
 
-SHIM_CALL KiApcNormalRoutineNop_shim(PPCContext* ppc_state,
-                                     KernelState* state) {
+SHIM_CALL KiApcNormalRoutineNop_shim(PPCContext* ppc_context,
+                                     KernelState* kernel_state) {
   uint32_t unk0 = SHIM_GET_ARG_32(0);  // output?
   uint32_t unk1 = SHIM_GET_ARG_32(1);  // 0x13
 
   XELOGD("KiApcNormalRoutineNop(%.8X, %.8X)", unk0, unk1);
 
-  SHIM_SET_RETURN_64(0);
+  SHIM_SET_RETURN_32(0);
 }
 
-SHIM_CALL KeInitializeDpc_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeInitializeDpc_shim(PPCContext* ppc_context,
+                               KernelState* kernel_state) {
   uint32_t dpc_ptr = SHIM_GET_ARG_32(0);
   uint32_t routine = SHIM_GET_ARG_32(1);
   uint32_t context = SHIM_GET_ARG_32(2);
@@ -1219,7 +1218,8 @@ SHIM_CALL KeInitializeDpc_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_MEM_32(dpc_ptr + 24, 0);  // arg2
 }
 
-SHIM_CALL KeInsertQueueDpc_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeInsertQueueDpc_shim(PPCContext* ppc_context,
+                                KernelState* kernel_state) {
   uint32_t dpc_ptr = SHIM_GET_ARG_32(0);
   uint32_t arg1 = SHIM_GET_ARG_32(1);
   uint32_t arg2 = SHIM_GET_ARG_32(2);
@@ -1231,14 +1231,14 @@ SHIM_CALL KeInsertQueueDpc_shim(PPCContext* ppc_state, KernelState* state) {
   uint32_t list_entry_ptr = dpc_ptr + 4;
 
   // Lock dispatcher.
-  auto dispatcher = state->dispatcher();
+  auto dispatcher = kernel_state->dispatcher();
   dispatcher->Lock();
 
   auto dpc_list = dispatcher->dpc_list();
 
   // If already in a queue, abort.
   if (dpc_list->IsQueued(list_entry_ptr)) {
-    SHIM_SET_RETURN_64(0);
+    SHIM_SET_RETURN_32(0);
     dispatcher->Unlock();
     return;
   }
@@ -1251,10 +1251,11 @@ SHIM_CALL KeInsertQueueDpc_shim(PPCContext* ppc_state, KernelState* state) {
 
   dispatcher->Unlock();
 
-  SHIM_SET_RETURN_64(1);
+  SHIM_SET_RETURN_32(1);
 }
 
-SHIM_CALL KeRemoveQueueDpc_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL KeRemoveQueueDpc_shim(PPCContext* ppc_context,
+                                KernelState* kernel_state) {
   uint32_t dpc_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("KeRemoveQueueDpc(%.8X)", dpc_ptr);
@@ -1263,7 +1264,7 @@ SHIM_CALL KeRemoveQueueDpc_shim(PPCContext* ppc_state, KernelState* state) {
 
   uint32_t list_entry_ptr = dpc_ptr + 4;
 
-  auto dispatcher = state->dispatcher();
+  auto dispatcher = kernel_state->dispatcher();
   dispatcher->Lock();
 
   auto dpc_list = dispatcher->dpc_list();
@@ -1274,14 +1275,47 @@ SHIM_CALL KeRemoveQueueDpc_shim(PPCContext* ppc_state, KernelState* state) {
 
   dispatcher->Unlock();
 
-  SHIM_SET_RETURN_64(result ? 1 : 0);
+  SHIM_SET_RETURN_32(result ? 1 : 0);
 }
+
+xe::mutex global_list_mutex_;
+
+pointer_result_t InterlockedPopEntrySList(pointer_t<X_SLIST_HEADER> plist_ptr) {
+  std::lock_guard<xe::mutex> lock(global_list_mutex_);
+
+  if (plist_ptr->next.next == 0) {
+    // List empty!
+    return 0;
+  }
+
+  // Get the first element.
+  auto result = kernel_memory()->TranslateVirtual<X_SINGLE_LIST_ENTRY*>(
+      plist_ptr->next.next);
+
+  uint32_t popped = plist_ptr->next.next;
+  plist_ptr->next.next = result->next;
+
+  // Return the one we popped
+  return popped;
+}
+DECLARE_XBOXKRNL_EXPORT(InterlockedPopEntrySList, ExportTag::kImplemented);
+
+pointer_result_t InterlockedFlushSList(pointer_t<X_SLIST_HEADER> plist_ptr) {
+  std::lock_guard<xe::mutex> lock(global_list_mutex_);
+
+  uint32_t next = plist_ptr->next.next;
+  plist_ptr->next.next = 0;
+  plist_ptr->depth = 0;
+
+  return next;
+}
+DECLARE_XBOXKRNL_EXPORT(InterlockedFlushSList, ExportTag::kImplemented);
 
 }  // namespace kernel
 }  // namespace xe
 
 void xe::kernel::xboxkrnl::RegisterThreadingExports(
-    ExportResolver* export_resolver, KernelState* state) {
+    xe::cpu::ExportResolver* export_resolver, KernelState* kernel_state) {
   SHIM_SET_MAPPING("xboxkrnl.exe", ExCreateThread, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", ExTerminateThread, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", NtResumeThread, state);
@@ -1306,19 +1340,12 @@ void xe::kernel::xboxkrnl::RegisterThreadingExports(
   SHIM_SET_MAPPING("xboxkrnl.exe", KeTlsSetValue, state);
 
   SHIM_SET_MAPPING("xboxkrnl.exe", NtCreateEvent, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", KeSetEvent, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", NtSetEvent, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", KePulseEvent, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", NtPulseEvent, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", KeResetEvent, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", NtClearEvent, state);
 
   SHIM_SET_MAPPING("xboxkrnl.exe", NtCreateSemaphore, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", KeInitializeSemaphore, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", KeReleaseSemaphore, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", NtReleaseSemaphore, state);
 
-  SHIM_SET_MAPPING("xboxkrnl.exe", NtCreateMutant, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", NtReleaseMutant, state);
 
   SHIM_SET_MAPPING("xboxkrnl.exe", NtCreateTimer, state);
@@ -1328,7 +1355,6 @@ void xe::kernel::xboxkrnl::RegisterThreadingExports(
   SHIM_SET_MAPPING("xboxkrnl.exe", KeWaitForSingleObject, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", NtWaitForSingleObjectEx, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", KeWaitForMultipleObjects, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", NtWaitForMultipleObjectsEx, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", NtSignalAndWaitForSingleObjectEx, state);
 
   SHIM_SET_MAPPING("xboxkrnl.exe", KfAcquireSpinLock, state);

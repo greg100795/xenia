@@ -11,22 +11,31 @@
 #define XENIA_GPU_GL4_COMMAND_PROCESSOR_H_
 
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <queue>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
-#include "xenia/gpu/gl4/circular_buffer.h"
+#include "xenia/base/threading.h"
 #include "xenia/gpu/gl4/draw_batcher.h"
-#include "xenia/gpu/gl4/gl_context.h"
 #include "xenia/gpu/gl4/gl4_shader.h"
+#include "xenia/gpu/gl4/gl4_shader_translator.h"
 #include "xenia/gpu/gl4/texture_cache.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/tracing.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/kernel/objects/xthread.h"
 #include "xenia/memory.h"
+#include "xenia/ui/gl/circular_buffer.h"
+#include "xenia/ui/gl/gl_context.h"
+
+namespace xe {
+namespace kernel {
+class XHostThread;
+}  // namespace kernel
+}  // namespace xe
 
 namespace xe {
 namespace gpu {
@@ -34,13 +43,18 @@ namespace gl4 {
 
 class GL4GraphicsSystem;
 
-struct SwapParameters {
-  uint32_t x;
-  uint32_t y;
-  uint32_t width;
-  uint32_t height;
-
-  GLuint framebuffer_texture;
+struct SwapState {
+  // Lock must be held when changing data in this structure.
+  xe::mutex mutex;
+  // Dimensions of the framebuffer textures. Should match window size.
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // Current front buffer, being drawn to the screen.
+  GLuint front_buffer_texture = 0;
+  // Current back buffer, being updated by the CP.
+  GLuint back_buffer_texture = 0;
+  // Whether the back buffer is dirty and a swap is pending.
+  bool pending = false;
 };
 
 enum class SwapMode {
@@ -53,20 +67,23 @@ class CommandProcessor {
   CommandProcessor(GL4GraphicsSystem* graphics_system);
   ~CommandProcessor();
 
-  typedef std::function<void(const SwapParameters& params)> SwapHandler;
-  void set_swap_handler(SwapHandler fn) { swap_handler_ = fn; }
-
-  uint64_t QueryTime();
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
 
-  bool Initialize(std::unique_ptr<GLContext> context);
+  bool Initialize(std::unique_ptr<xe::ui::GraphicsContext> context);
   void Shutdown();
   void CallInThread(std::function<void()> fn);
 
+  void ClearCaches();
+
+  SwapState& swap_state() { return swap_state_; }
   void set_swap_mode(SwapMode swap_mode) { swap_mode_ = swap_mode; }
-  void IssueSwap();
-  void IssueSwap(uint32_t frontbuffer_width, uint32_t frontbuffer_height);
+  void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                 uint32_t frontbuffer_height);
+
+  void set_swap_request_handler(std::function<void()> fn) {
+    swap_request_handler_ = fn;
+  }
 
   void RequestFrameTrace(const std::wstring& root_path);
   void BeginTracing(const std::wstring& root_path);
@@ -134,7 +151,7 @@ class CommandProcessor {
     } handles;
   };
 
-  void WorkerMain();
+  void WorkerThreadMain();
   bool SetupGL();
   void ShutdownGL();
   GLuint CreateGeometryProgram(const std::string& source);
@@ -226,15 +243,15 @@ class CommandProcessor {
   TraceState trace_state_;
   std::wstring trace_frame_path_;
 
-  std::thread worker_thread_;
   std::atomic<bool> worker_running_;
-  std::unique_ptr<GLContext> context_;
-  SwapHandler swap_handler_;
+  kernel::object_ref<kernel::XHostThread> worker_thread_;
+
+  std::unique_ptr<xe::ui::GraphicsContext> context_;
+  SwapMode swap_mode_;
+  SwapState swap_state_;
+  std::function<void()> swap_request_handler_;
   std::queue<std::function<void()>> pending_fns_;
 
-  SwapMode swap_mode_;
-
-  uint64_t time_base_;
   uint32_t counter_;
 
   uint32_t primary_buffer_ptr_;
@@ -244,22 +261,19 @@ class CommandProcessor {
   uint32_t read_ptr_update_freq_;
   uint32_t read_ptr_writeback_ptr_;
 
-  HANDLE write_ptr_index_event_;
+  std::unique_ptr<xe::threading::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;
 
   uint64_t bin_select_;
   uint64_t bin_mask_;
 
-  bool has_bindless_vbos_;
-
+  GL4ShaderTranslator shader_translator_;
   std::vector<std::unique_ptr<GL4Shader>> all_shaders_;
   std::unordered_map<uint64_t, GL4Shader*> shader_cache_;
   GL4Shader* active_vertex_shader_;
   GL4Shader* active_pixel_shader_;
   CachedFramebuffer* active_framebuffer_;
   GLuint last_framebuffer_texture_;
-  uint32_t last_swap_width_;
-  uint32_t last_swap_height_;
 
   std::vector<CachedFramebuffer> cached_framebuffers_;
   std::vector<CachedColorRenderTarget> cached_color_render_targets_;
@@ -282,7 +296,7 @@ class CommandProcessor {
   TextureCache texture_cache_;
 
   DrawBatcher draw_batcher_;
-  CircularBuffer scratch_buffer_;
+  xe::ui::gl::CircularBuffer scratch_buffer_;
 
  private:
   bool SetShadowRegister(uint32_t& dest, uint32_t register_name);

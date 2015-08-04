@@ -9,18 +9,20 @@
 
 #include "xenia/gpu/gl4/texture_cache.h"
 
-#include "poly/assert.h"
-#include "poly/math.h"
-#include "xenia/gpu/gpu-private.h"
+#include <cstring>
+
+#include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/base/memory.h"
+#include "xenia/gpu/gpu_flags.h"
+#include "xenia/profiling.h"
 
 namespace xe {
 namespace gpu {
 namespace gl4 {
 
 using namespace xe::gpu::xenos;
-
-extern "C" GLEWContext* glewGetContext();
-extern "C" WGLEWContext* wglewGetContext();
 
 struct TextureConfig {
   TextureFormat texture_format;
@@ -39,9 +41,9 @@ static const TextureConfig texture_configs[64] = {
     {TextureFormat::k_8, GL_R8, GL_RED, GL_UNSIGNED_BYTE},
     {TextureFormat::k_1_5_5_5, GL_RGB5_A1, GL_RGBA,
      GL_UNSIGNED_SHORT_1_5_5_5_REV},
-    {TextureFormat::k_5_6_5, GL_RGB565, GL_RGB, GL_UNSIGNED_SHORT_5_6_5},
+    {TextureFormat::k_5_6_5, GL_RGB565, GL_RGB, GL_UNSIGNED_SHORT_5_6_5_REV},
     {TextureFormat::k_6_5_5, GL_INVALID_ENUM, GL_INVALID_ENUM, GL_INVALID_ENUM},
-    {TextureFormat::k_8_8_8_8, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE},
+    {TextureFormat::k_8_8_8_8, GL_RGBA8, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8_REV},
     {TextureFormat::k_2_10_10_10, GL_RGB10_A2, GL_RGBA,
      GL_UNSIGNED_INT_2_10_10_10_REV},
     {TextureFormat::k_8_A, GL_INVALID_ENUM, GL_INVALID_ENUM, GL_INVALID_ENUM},
@@ -83,10 +85,9 @@ static const TextureConfig texture_configs[64] = {
     {TextureFormat::k_16_FLOAT, GL_R16F, GL_RED, GL_HALF_FLOAT},
     {TextureFormat::k_16_16_FLOAT, GL_RG16F, GL_RG, GL_HALF_FLOAT},
     {TextureFormat::k_16_16_16_16_FLOAT, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT},
-    {TextureFormat::k_32, GL_INVALID_ENUM, GL_INVALID_ENUM, GL_INVALID_ENUM},
-    {TextureFormat::k_32_32, GL_INVALID_ENUM, GL_INVALID_ENUM, GL_INVALID_ENUM},
-    {TextureFormat::k_32_32_32_32, GL_INVALID_ENUM, GL_INVALID_ENUM,
-     GL_INVALID_ENUM},
+    {TextureFormat::k_32, GL_R32I, GL_RED, GL_UNSIGNED_INT},
+    {TextureFormat::k_32_32, GL_RG32I, GL_RG, GL_UNSIGNED_INT},
+    {TextureFormat::k_32_32_32_32, GL_RGBA32I, GL_RGBA, GL_UNSIGNED_INT},
     {TextureFormat::k_32_FLOAT, GL_R32F, GL_RED, GL_FLOAT},
     {TextureFormat::k_32_32_FLOAT, GL_RG32F, GL_RG, GL_FLOAT},
     {TextureFormat::k_32_32_32_32_FLOAT, GL_RGBA32F, GL_RGBA, GL_FLOAT},
@@ -127,7 +128,8 @@ static const TextureConfig texture_configs[64] = {
     {TextureFormat::k_11_11_10_AS_16_16_16_16, GL_R11F_G11F_B10F,
      GL_INVALID_ENUM, GL_INVALID_ENUM},
     {TextureFormat::k_32_32_32_FLOAT, GL_RGB32F, GL_RGB, GL_FLOAT},
-    {TextureFormat::k_DXT3A, GL_INVALID_ENUM, GL_INVALID_ENUM, GL_INVALID_ENUM},
+    {TextureFormat::k_DXT3A, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT,
+     GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, GL_UNSIGNED_BYTE},
     {TextureFormat::k_DXT5A, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
      GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, GL_UNSIGNED_BYTE},
     {TextureFormat::k_CTX1, GL_INVALID_ENUM, GL_INVALID_ENUM, GL_INVALID_ENUM},
@@ -193,7 +195,7 @@ void TextureCache::EvictAllTextures() {
   }
 
   {
-    std::lock_guard<std::mutex> lock(invalidated_textures_mutex_);
+    std::lock_guard<xe::mutex> lock(invalidated_textures_mutex_);
     invalidated_textures_sets_[0].clear();
     invalidated_textures_sets_[1].clear();
   }
@@ -213,7 +215,7 @@ TextureCache::TextureEntryView* TextureCache::Demand(
   uint64_t texture_hash = texture_info.hash();
   auto texture_entry = LookupOrInsertTexture(texture_info, texture_hash);
   if (!texture_entry) {
-    PLOGE("Failed to setup texture");
+    XELOGE("Failed to setup texture");
     return nullptr;
   }
 
@@ -229,7 +231,7 @@ TextureCache::TextureEntryView* TextureCache::Demand(
   // No existing view found - build it.
   auto sampler_entry = LookupOrInsertSampler(sampler_info, sampler_hash);
   if (!sampler_entry) {
-    PLOGE("Failed to setup texture sampler");
+    XELOGE("Failed to setup texture sampler");
     return nullptr;
   }
 
@@ -357,8 +359,34 @@ TextureCache::SamplerEntry* TextureCache::LookupOrInsertSampler(
   glSamplerParameteri(entry->handle, GL_TEXTURE_MIN_FILTER, min_filter);
   glSamplerParameteri(entry->handle, GL_TEXTURE_MAG_FILTER, mag_filter);
 
-  // TODO(benvanik): anisotropic filtering.
-  // GL_TEXTURE_MAX_ANISOTROPY_EXT
+  GLfloat aniso;
+  switch (sampler_info.aniso_filter) {
+    case ucode::ANISO_FILTER_DISABLED:
+      aniso = 0.0f;
+      break;
+    case ucode::ANISO_FILTER_MAX_1_1:
+      aniso = 1.0f;
+      break;
+    case ucode::ANISO_FILTER_MAX_2_1:
+      aniso = 2.0f;
+      break;
+    case ucode::ANISO_FILTER_MAX_4_1:
+      aniso = 4.0f;
+      break;
+    case ucode::ANISO_FILTER_MAX_8_1:
+      aniso = 8.0f;
+      break;
+    case ucode::ANISO_FILTER_MAX_16_1:
+      aniso = 16.0f;
+      break;
+    default:
+      assert_unhandled_case(aniso);
+      return nullptr;
+  }
+
+  if (aniso) {
+    glSamplerParameterf(entry->handle, GL_TEXTURE_MAX_ANISOTROPY_EXT, aniso);
+  }
 
   // Add to map - map takes ownership.
   auto entry_ptr = entry.get();
@@ -477,17 +505,17 @@ TextureCache::TextureEntry* TextureCache::LookupOrInsertTexture(
     case Dimension::k1D:
     case Dimension::k3D:
       assert_unhandled_case(texture_info.dimension);
-      return false;
+      return nullptr;
   }
   if (!uploaded) {
-    PLOGE("Failed to convert/upload texture");
+    XELOGE("Failed to convert/upload texture");
     return nullptr;
   }
 
   // Add a write watch. If any data in the given range is touched we'll get a
   // callback and evict the texture. We could reuse the storage, though the
   // driver is likely in a better position to pool that kind of stuff.
-  entry->write_watch_handle = memory_->AddWriteWatch(
+  entry->write_watch_handle = memory_->AddPhysicalWriteWatch(
       texture_info.guest_address, texture_info.input_length,
       [](void* context_ptr, void* data_ptr, uint32_t address) {
         auto self = reinterpret_cast<TextureCache*>(context_ptr);
@@ -650,22 +678,19 @@ void TextureSwap(Endian endianness, void* dest, const void* src,
                  size_t length) {
   switch (endianness) {
     case Endian::k8in16:
-      poly::copy_and_swap_16_aligned(reinterpret_cast<uint16_t*>(dest),
-                                     reinterpret_cast<const uint16_t*>(src),
-                                     length / 2);
+      xe::copy_and_swap_16_aligned(reinterpret_cast<uint16_t*>(dest),
+                                   reinterpret_cast<const uint16_t*>(src),
+                                   length / 2);
       break;
     case Endian::k8in32:
-      poly::copy_and_swap_32_aligned(reinterpret_cast<uint32_t*>(dest),
-                                     reinterpret_cast<const uint32_t*>(src),
-                                     length / 4);
+      xe::copy_and_swap_32_aligned(reinterpret_cast<uint32_t*>(dest),
+                                   reinterpret_cast<const uint32_t*>(src),
+                                   length / 4);
       break;
-    case Endian::k16in32:
-      // TODO(benvanik): make more efficient.
-      /*for (uint32_t i = 0; i < length; i += 4, src += 4, dest += 4) {
-        uint32_t value = *(uint32_t*)src;
-        *(uint32_t*)dest = ((value >> 16) & 0xFFFF) | (value << 16);
-      }*/
-      assert_always("16in32 not supported");
+    case Endian::k16in32:  // Swap high and low 16 bits within a 32 bit word
+      xe::copy_and_swap_16_in_32_aligned(reinterpret_cast<uint32_t*>(dest),
+                                         reinterpret_cast<const uint32_t*>(src),
+                                         length);
       break;
     default:
     case Endian::kUnspecified:
@@ -676,6 +701,7 @@ void TextureSwap(Endian endianness, void* dest, const void* src,
 
 bool TextureCache::UploadTexture2D(GLuint texture,
                                    const TextureInfo& texture_info) {
+  SCOPE_profile_cpu_f("gpu");
   const auto host_address =
       memory_->TranslatePhysical(texture_info.guest_address);
 
@@ -706,7 +732,9 @@ bool TextureCache::UploadTexture2D(GLuint texture,
       uint8_t* dest = reinterpret_cast<uint8_t*>(allocation.host_ptr);
       uint32_t pitch = std::min(texture_info.size_2d.input_pitch,
                                 texture_info.size_2d.output_pitch);
-      for (uint32_t y = 0; y < texture_info.size_2d.block_height; y++) {
+      for (uint32_t y = 0; y < std::min(texture_info.size_2d.block_height,
+                                        texture_info.size_2d.logical_height);
+           y++) {
         TextureSwap(texture_info.endianness, dest, src, pitch);
         src += texture_info.size_2d.input_pitch;
         dest += texture_info.size_2d.output_pitch;
@@ -731,7 +759,8 @@ bool TextureCache::UploadTexture2D(GLuint texture,
     auto bpp = (bytes_per_block >> 2) +
                ((bytes_per_block >> 1) >> (bytes_per_block >> 2));
     for (uint32_t y = 0, output_base_offset = 0;
-         y < texture_info.size_2d.block_height;
+         y < std::min(texture_info.size_2d.block_height,
+                      texture_info.size_2d.logical_height);
          y++, output_base_offset += texture_info.size_2d.output_pitch) {
       auto input_base_offset = TextureInfo::TiledOffset2DOuter(
           offset_y + y, (texture_info.size_2d.input_width /
@@ -779,6 +808,7 @@ bool TextureCache::UploadTexture2D(GLuint texture,
 
 bool TextureCache::UploadTextureCube(GLuint texture,
                                      const TextureInfo& texture_info) {
+  SCOPE_profile_cpu_f("gpu");
   const auto host_address =
       memory_->TranslatePhysical(texture_info.guest_address);
 

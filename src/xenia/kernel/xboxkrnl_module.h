@@ -10,8 +10,10 @@
 #ifndef XENIA_KERNEL_XBOXKRNL_MODULE_H_
 #define XENIA_KERNEL_XBOXKRNL_MODULE_H_
 
-#include "xenia/common.h"
-#include "xenia/export_resolver.h"
+#include <memory>
+
+#include "xenia/base/threading.h"
+#include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/objects/xkernel_module.h"
 #include "xenia/kernel/xboxkrnl_ordinals.h"
 
@@ -28,12 +30,12 @@ class XboxkrnlModule : public XKernelModule {
   XboxkrnlModule(Emulator* emulator, KernelState* kernel_state);
   virtual ~XboxkrnlModule();
 
-  static void RegisterExportTable(ExportResolver* export_resolver);
+  static void RegisterExportTable(xe::cpu::ExportResolver* export_resolver);
 
   int LaunchModule(const char* path);
 
  private:
-  HANDLE timestamp_timer_;
+  std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;
 };
 
 }  // namespace kernel

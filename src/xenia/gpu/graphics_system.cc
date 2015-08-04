@@ -9,26 +9,42 @@
 
 #include "xenia/gpu/graphics_system.h"
 
-#include "poly/poly.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/cpu/processor.h"
-#include "xenia/gpu/gpu-private.h"
+#include "xenia/gpu/gpu_flags.h"
+#include "xenia/kernel/objects/xthread.h"
 
 namespace xe {
 namespace gpu {
 
-GraphicsSystem::GraphicsSystem()
-    : memory_(nullptr),
-      processor_(nullptr),
-      target_loop_(nullptr),
-      target_window_(nullptr),
-      interrupt_callback_(0),
-      interrupt_callback_data_(0) {}
+namespace gl4 {
+std::unique_ptr<GraphicsSystem> Create(Emulator* emulator);
+}  // namespace gl4
+
+std::unique_ptr<GraphicsSystem> GraphicsSystem::Create(Emulator* emulator) {
+  if (FLAGS_gpu.compare("gl4") == 0) {
+    return xe::gpu::gl4::Create(emulator);
+  } else {
+    // Create best available.
+    std::unique_ptr<GraphicsSystem> best;
+
+    best = xe::gpu::gl4::Create(emulator);
+    if (best) {
+      return best;
+    }
+
+    // Nothing!
+    return nullptr;
+  }
+}
+
+GraphicsSystem::GraphicsSystem(Emulator* emulator) : emulator_(emulator) {}
 
 GraphicsSystem::~GraphicsSystem() = default;
 
-X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
-                               ui::PlatformLoop* target_loop,
-                               ui::PlatformWindow* target_window) {
+X_STATUS GraphicsSystem::Setup(cpu::Processor* processor, ui::Loop* target_loop,
+                               ui::Window* target_window) {
   processor_ = processor;
   memory_ = processor->memory();
   target_loop_ = target_loop;
@@ -51,18 +67,21 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
     return;
   }
 
+  auto thread = kernel::XThread::GetCurrentThread();
+  assert_not_null(thread);
+
   // Pick a CPU, if needed. We're going to guess 2. Because.
   if (cpu == 0xFFFFFFFF) {
     cpu = 2;
   }
+  thread->SetActiveCpu(cpu);
 
   // XELOGGPU("Dispatching GPU interrupt at %.8X w/ mode %d on cpu %d",
   //         interrupt_callback_, source, cpu);
 
-  // NOTE: we may be executing in some random thread.
   uint64_t args[] = {source, interrupt_callback_data_};
-  processor_->ExecuteInterrupt(cpu, interrupt_callback_, args,
-                               poly::countof(args));
+  processor_->Execute(thread->thread_state(), interrupt_callback_, args,
+                      xe::countof(args));
 }
 
 }  // namespace gpu

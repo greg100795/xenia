@@ -10,7 +10,7 @@
 #ifndef XENIA_KERNEL_XAM_PRIVATE_H_
 #define XENIA_KERNEL_XAM_PRIVATE_H_
 
-#include "xenia/common.h"
+#include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/xam_ordinals.h"
 
 namespace xe {
@@ -18,19 +18,34 @@ namespace kernel {
 
 class KernelState;
 
+xe::cpu::Export* RegisterExport_xam(xe::cpu::Export* export_entry);
+
 namespace xam {
 // Registration functions, one per file.
-void RegisterContentExports(ExportResolver* export_resolver,
-                            KernelState* state);
-void RegisterInfoExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterInputExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterMsgExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterNetExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterNotifyExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterUIExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterUserExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterVideoExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterVoiceExports(ExportResolver* export_resolver, KernelState* state);
+void RegisterAvatarExports(xe::cpu::ExportResolver* export_resolver,
+                           KernelState* kernel_state);
+void RegisterContentExports(xe::cpu::ExportResolver* export_resolver,
+                            KernelState* kernel_state);
+void RegisterInfoExports(xe::cpu::ExportResolver* export_resolver,
+                         KernelState* kernel_state);
+void RegisterInputExports(xe::cpu::ExportResolver* export_resolver,
+                          KernelState* kernel_state);
+void RegisterMsgExports(xe::cpu::ExportResolver* export_resolver,
+                        KernelState* kernel_state);
+void RegisterNetExports(xe::cpu::ExportResolver* export_resolver,
+                        KernelState* kernel_state);
+void RegisterNotifyExports(xe::cpu::ExportResolver* export_resolver,
+                           KernelState* kernel_state);
+void RegisterNuiExports(xe::cpu::ExportResolver* export_resolver,
+                        KernelState* kernel_state);
+void RegisterUIExports(xe::cpu::ExportResolver* export_resolver,
+                       KernelState* kernel_state);
+void RegisterUserExports(xe::cpu::ExportResolver* export_resolver,
+                         KernelState* kernel_state);
+void RegisterVideoExports(xe::cpu::ExportResolver* export_resolver,
+                          KernelState* kernel_state);
+void RegisterVoiceExports(xe::cpu::ExportResolver* export_resolver,
+                          KernelState* kernel_state);
 }  // namespace xam
 
 }  // namespace kernel

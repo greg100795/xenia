@@ -9,6 +9,7 @@
 
 #include "xenia/cpu/hir/block.h"
 
+#include "xenia/base/assert.h"
 #include "xenia/cpu/hir/instr.h"
 
 namespace xe {

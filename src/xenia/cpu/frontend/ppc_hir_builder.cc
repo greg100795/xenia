@@ -9,13 +9,18 @@
 
 #include "xenia/cpu/frontend/ppc_hir_builder.h"
 
-#include "xenia/cpu/cpu-private.h"
+#include <cstring>
+
+#include "xenia/base/byte_order.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
+#include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/frontend/ppc_context.h"
 #include "xenia/cpu/frontend/ppc_disasm.h"
 #include "xenia/cpu/frontend/ppc_frontend.h"
 #include "xenia/cpu/frontend/ppc_instr.h"
 #include "xenia/cpu/hir/label.h"
-#include "xenia/cpu/runtime.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/profiling.h"
 
 namespace xe {
@@ -42,7 +47,7 @@ void PPCHIRBuilder::Reset() {
   HIRBuilder::Reset();
 }
 
-int PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
+bool PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
   SCOPE_profile_cpu_f("cpu");
 
   Memory* memory = frontend_->memory();
@@ -53,9 +58,9 @@ int PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
 
   with_debug_info_ = (flags & EMIT_DEBUG_COMMENTS) == EMIT_DEBUG_COMMENTS;
   if (with_debug_info_) {
-    Comment("%s fn %.8X-%.8X %s", symbol_info->module()->name().c_str(),
-            symbol_info->address(), symbol_info->end_address(),
-            symbol_info->name().c_str());
+    CommentFormat("%s fn %.8X-%.8X %s", symbol_info->module()->name().c_str(),
+                  symbol_info->address(), symbol_info->end_address(),
+                  symbol_info->name().c_str());
   }
 
   // Allocate offset list.
@@ -67,8 +72,8 @@ int PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
   size_t list_size = instr_count_ * sizeof(void*);
   instr_offset_list_ = (Instr**)arena_->Alloc(list_size);
   label_list_ = (Label**)arena_->Alloc(list_size);
-  memset(instr_offset_list_, 0, list_size);
-  memset(label_list_, 0, list_size);
+  std::memset(instr_offset_list_, 0, list_size);
+  std::memset(label_list_, 0, list_size);
 
   // Always mark entry with label.
   label_list_[0] = NewLabel();
@@ -79,7 +84,7 @@ int PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
     i.address = address;
-    i.code = poly::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
+    i.code = xe::load_and_swap<uint32_t>(memory->TranslateVirtual(address));
     // TODO(benvanik): find a way to avoid using the opcode tables.
     i.type = GetInstrType(i.code);
     trace_info_.dest_count = 0;
@@ -98,8 +103,9 @@ int PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
         AnnotateLabel(address, label);
       }
       comment_buffer_.Reset();
+      comment_buffer_.AppendFormat("%.8X %.8X ", address, i.code);
       DisasmPPC(i, &comment_buffer_);
-      Comment("%.8X %.8X %s", address, i.code, comment_buffer_.GetString());
+      Comment(comment_buffer_);
       first_instr = last_instr();
     }
 
@@ -114,7 +120,7 @@ int PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
     instr_offset_list_[offset] = first_instr;
 
     if (!i.type) {
-      PLOGE("Invalid instruction %.8llX %.8X", i.address, i.code);
+      XELOGE("Invalid instruction %.8llX %.8X", i.address, i.code);
       Comment("INVALID!");
       // TraceInvalidInstruction(i);
       continue;
@@ -126,39 +132,26 @@ int PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
 
     if (i.address == FLAGS_break_on_instruction) {
       Comment("--break-on-instruction target");
-      DebugBreak();
+
+      if (FLAGS_break_condition_gpr < 0) {
+        DebugBreak();
+      } else {
+        auto left = LoadGPR(FLAGS_break_condition_gpr);
+        auto right = LoadConstantUint64(FLAGS_break_condition_value);
+        if (FLAGS_break_condition_truncate) {
+          left = Truncate(left, INT32_TYPE);
+          right = Truncate(right, INT32_TYPE);
+        }
+        TrapTrue(CompareEQ(left, right));
+      }
     }
 
     if (!i.type->emit || emit(*this, i)) {
-      PLOGE("Unimplemented instr %.8llX %.8X %s", i.address, i.code,
-            i.type->name);
+      XELOGE("Unimplemented instr %.8llX %.8X %s", i.address, i.code,
+             i.type->name);
       Comment("UNIMPLEMENTED!");
       // DebugBreak();
       // TraceInvalidInstruction(i);
-    }
-
-    if (flags & EMIT_TRACE_SOURCE) {
-      if (flags & EMIT_TRACE_SOURCE_VALUES) {
-        switch (trace_info_.dest_count) {
-          case 0:
-            TraceSource(i.address);
-            break;
-          case 1:
-            TraceSource(i.address, trace_info_.dests[0].reg,
-                        trace_info_.dests[0].value);
-            break;
-          case 2:
-            TraceSource(i.address, trace_info_.dests[0].reg,
-                        trace_info_.dests[0].value, trace_info_.dests[1].reg,
-                        trace_info_.dests[1].value);
-            break;
-          default:
-            assert_unhandled_case(trace_info_.dest_count);
-            break;
-        }
-      } else {
-        TraceSource(i.address);
-      }
     }
   }
 
@@ -167,27 +160,27 @@ int PPCHIRBuilder::Emit(FunctionInfo* symbol_info, uint32_t flags) {
 
 void PPCHIRBuilder::AnnotateLabel(uint32_t address, Label* label) {
   char name_buffer[13];
-  snprintf(name_buffer, poly::countof(name_buffer), "loc_%.8X", address);
+  snprintf(name_buffer, xe::countof(name_buffer), "loc_%.8X", address);
   label->name = (char*)arena_->Alloc(sizeof(name_buffer));
   memcpy(label->name, name_buffer, sizeof(name_buffer));
 }
 
 FunctionInfo* PPCHIRBuilder::LookupFunction(uint32_t address) {
-  Runtime* runtime = frontend_->runtime();
+  Processor* processor = frontend_->processor();
   FunctionInfo* symbol_info;
-  if (runtime->LookupFunctionInfo(address, &symbol_info)) {
-    return NULL;
+  if (!processor->LookupFunctionInfo(address, &symbol_info)) {
+    return nullptr;
   }
   return symbol_info;
 }
 
 Label* PPCHIRBuilder::LookupLabel(uint32_t address) {
   if (address < start_address_) {
-    return NULL;
+    return nullptr;
   }
   size_t offset = (address - start_address_) / 4;
   if (offset >= instr_count_) {
-    return NULL;
+    return nullptr;
   }
   Label* label = label_list_[offset];
   if (label) {
@@ -298,16 +291,16 @@ void PPCHIRBuilder::StoreCR(uint32_t n, Value* value) {
   // Optimization passes will kill any unneeded stores (mostly).
   StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 0,
                And(Truncate(Shr(value, 4 * (7 - n) + 3), INT8_TYPE),
-                   LoadConstant(uint8_t(1))));
+                   LoadConstantUint8(1)));
   StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 1,
                And(Truncate(Shr(value, 4 * (7 - n) + 2), INT8_TYPE),
-                   LoadConstant(uint8_t(1))));
+                   LoadConstantUint8(1)));
   StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 2,
                And(Truncate(Shr(value, 4 * (7 - n) + 1), INT8_TYPE),
-                   LoadConstant(uint8_t(1))));
+                   LoadConstantUint8(1)));
   StoreContext(offsetof(PPCContext, cr0) + (4 * n) + 3,
                And(Truncate(Shr(value, 4 * (7 - n) + 0), INT8_TYPE),
-                   LoadConstant(uint8_t(1))));
+                   LoadConstantUint8(1)));
 }
 
 void PPCHIRBuilder::StoreCRField(uint32_t n, uint32_t bit, Value* value) {
@@ -317,7 +310,7 @@ void PPCHIRBuilder::StoreCRField(uint32_t n, uint32_t bit, Value* value) {
 }
 
 void PPCHIRBuilder::UpdateCR(uint32_t n, Value* lhs, bool is_signed) {
-  UpdateCR(n, Truncate(lhs, INT32_TYPE), LoadZero(INT32_TYPE), is_signed);
+  UpdateCR(n, Truncate(lhs, INT32_TYPE), LoadZeroInt32(), is_signed);
 }
 
 void PPCHIRBuilder::UpdateCR(uint32_t n, Value* lhs, Value* rhs,
@@ -346,8 +339,8 @@ void PPCHIRBuilder::UpdateCR6(Value* src_value) {
   // Testing for all 1's and all 0's.
   // if (Rc) CR6 = all_equal | 0 | none_equal | 0
   // TODO(benvanik): efficient instruction?
-  StoreContext(offsetof(PPCContext, cr6.cr6_1), LoadZero(INT8_TYPE));
-  StoreContext(offsetof(PPCContext, cr6.cr6_3), LoadZero(INT8_TYPE));
+  StoreContext(offsetof(PPCContext, cr6.cr6_1), LoadZeroInt8());
+  StoreContext(offsetof(PPCContext, cr6.cr6_3), LoadZeroInt8());
   StoreContext(offsetof(PPCContext, cr6.cr6_all_equal),
                IsFalse(Not(src_value)));
   StoreContext(offsetof(PPCContext, cr6.cr6_none_equal), IsFalse(src_value));
@@ -458,28 +451,19 @@ Value* PPCHIRBuilder::LoadAcquire(Value* address, TypeName type,
                                   uint32_t load_flags) {
   AtomicExchange(LoadContext(offsetof(PPCContext, reserve_address), INT64_TYPE),
                  Truncate(address, INT32_TYPE));
-  Value* value = Load(address, type, load_flags);
-  // Save the value so that we can compare it later in StoreRelease.
-  AtomicExchange(LoadContext(offsetof(PPCContext, reserve_value), INT64_TYPE),
-                 value);
-  return value;
+  return Load(address, type, load_flags);
 }
 
 Value* PPCHIRBuilder::StoreRelease(Value* address, Value* value,
                                    uint32_t store_flags) {
   Value* old_address = AtomicExchange(
       LoadContext(offsetof(PPCContext, reserve_address), INT64_TYPE),
-      LoadZero(INT32_TYPE));
-  // HACK: ensure the reservation addresses match AND the value hasn't changed.
-  Value* old_value = AtomicExchange(
-      LoadContext(offsetof(PPCContext, reserve_value), INT64_TYPE),
-      LoadZero(value->type));
-  Value* current_value = Load(address, value->type);
-  Value* eq = And(CompareEQ(Truncate(address, INT32_TYPE), old_address),
-                  CompareEQ(current_value, old_value));
+      LoadZeroInt32());
+  // Ensure the reservation addresses match.
+  Value* eq = CompareEQ(Truncate(address, INT32_TYPE), old_address);
   StoreContext(offsetof(PPCContext, cr0.cr0_eq), eq);
-  StoreContext(offsetof(PPCContext, cr0.cr0_lt), LoadZero(INT8_TYPE));
-  StoreContext(offsetof(PPCContext, cr0.cr0_gt), LoadZero(INT8_TYPE));
+  StoreContext(offsetof(PPCContext, cr0.cr0_lt), LoadZeroInt8());
+  StoreContext(offsetof(PPCContext, cr0.cr0_gt), LoadZeroInt8());
   auto skip_label = NewLabel();
   BranchFalse(eq, skip_label, BRANCH_UNLIKELY);
   Store(address, value, store_flags);

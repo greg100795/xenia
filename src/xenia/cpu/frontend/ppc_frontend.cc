@@ -13,13 +13,11 @@
 #include "xenia/cpu/frontend/ppc_disasm.h"
 #include "xenia/cpu/frontend/ppc_emit.h"
 #include "xenia/cpu/frontend/ppc_translator.h"
-#include "xenia/cpu/runtime.h"
+#include "xenia/cpu/processor.h"
 
 namespace xe {
 namespace cpu {
 namespace frontend {
-
-using xe::cpu::Runtime;
 
 void InitializeIfNeeded();
 void CleanupOnShutdown();
@@ -42,7 +40,7 @@ void InitializeIfNeeded() {
 
 void CleanupOnShutdown() {}
 
-PPCFrontend::PPCFrontend(Runtime* runtime) : runtime_(runtime) {
+PPCFrontend::PPCFrontend(Processor* processor) : processor_(processor) {
   InitializeIfNeeded();
 
   std::unique_ptr<ContextInfo> context_info(
@@ -57,52 +55,52 @@ PPCFrontend::~PPCFrontend() {
   translator_pool_.Reset();
 }
 
-Memory* PPCFrontend::memory() const { return runtime_->memory(); }
+Memory* PPCFrontend::memory() const { return processor_->memory(); }
 
-void CheckGlobalLock(PPCContext* ppc_state, void* arg0, void* arg1) {
-  ppc_state->scratch = 0x8000;
+void CheckGlobalLock(PPCContext* ppc_context, void* arg0, void* arg1) {
+  ppc_context->scratch = 0x8000;
 }
-void HandleGlobalLock(PPCContext* ppc_state, void* arg0, void* arg1) {
-  std::mutex* global_lock = reinterpret_cast<std::mutex*>(arg0);
+void HandleGlobalLock(PPCContext* ppc_context, void* arg0, void* arg1) {
+  auto global_lock = reinterpret_cast<xe::mutex*>(arg0);
   volatile bool* global_lock_taken = reinterpret_cast<bool*>(arg1);
-  uint64_t value = ppc_state->scratch;
+  uint64_t value = ppc_context->scratch;
   if (value == 0x8000) {
-    global_lock->unlock();
+    global_lock->lock();
     *global_lock_taken = false;
-  } else if (value == ppc_state->r[13]) {
+    global_lock->unlock();
+  } else if (value == ppc_context->r[13]) {
     global_lock->lock();
     *global_lock_taken = true;
+    global_lock->unlock();
   }
 }
 
-int PPCFrontend::Initialize() {
+bool PPCFrontend::Initialize() {
   void* arg0 = reinterpret_cast<void*>(&builtins_.global_lock);
   void* arg1 = reinterpret_cast<void*>(&builtins_.global_lock_taken);
-  builtins_.check_global_lock = runtime_->DefineBuiltin(
-      "CheckGlobalLock", (FunctionInfo::ExternHandler)CheckGlobalLock, arg0,
-      arg1);
-  builtins_.handle_global_lock = runtime_->DefineBuiltin(
-      "HandleGlobalLock", (FunctionInfo::ExternHandler)HandleGlobalLock, arg0,
-      arg1);
+  builtins_.check_global_lock =
+      processor_->DefineBuiltin("CheckGlobalLock", CheckGlobalLock, arg0, arg1);
+  builtins_.handle_global_lock = processor_->DefineBuiltin(
+      "HandleGlobalLock", HandleGlobalLock, arg0, arg1);
 
-  return 0;
+  return true;
 }
 
-int PPCFrontend::DeclareFunction(FunctionInfo* symbol_info) {
+bool PPCFrontend::DeclareFunction(FunctionInfo* symbol_info) {
   // Could scan or something here.
   // Could also check to see if it's a well-known function type and classify
   // for later.
   // Could also kick off a precompiler, since we know it's likely the function
   // will be demanded soon.
-  return 0;
+  return true;
 }
 
-int PPCFrontend::DefineFunction(FunctionInfo* symbol_info,
-                                uint32_t debug_info_flags, uint32_t trace_flags,
-                                Function** out_function) {
+bool PPCFrontend::DefineFunction(FunctionInfo* symbol_info,
+                                 uint32_t debug_info_flags,
+                                 Function** out_function) {
   PPCTranslator* translator = translator_pool_.Allocate(this);
-  int result = translator->Translate(symbol_info, debug_info_flags, trace_flags,
-                                     out_function);
+  bool result =
+      translator->Translate(symbol_info, debug_info_flags, out_function);
   translator_pool_.Release(translator);
   return result;
 }

@@ -9,85 +9,128 @@
 
 #include "xenia/gpu/gl4/gl4_graphics_system.h"
 
-#include "poly/threading.h"
+#include <cstring>
+
+#include "xenia/base/clock.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/threading.h"
 #include "xenia/cpu/processor.h"
-#include "xenia/gpu/gl4/gl4_gpu-private.h"
-#include "xenia/gpu/gl4/gl4_profiler_display.h"
-#include "xenia/gpu/gpu-private.h"
+#include "xenia/emulator.h"
+#include "xenia/gpu/gl4/gl4_gpu_flags.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/tracing.h"
+#include "xenia/profiling.h"
+#include "xenia/ui/window.h"
 
 namespace xe {
 namespace gpu {
 namespace gl4 {
 
-extern "C" GLEWContext* glewGetContext();
+void InitializeIfNeeded();
+void CleanupOnShutdown();
 
-GL4GraphicsSystem::GL4GraphicsSystem()
-    : GraphicsSystem(), timer_queue_(nullptr), vsync_timer_(nullptr) {}
+void InitializeIfNeeded() {
+  static bool has_initialized = false;
+  if (has_initialized) {
+    return;
+  }
+  has_initialized = true;
+
+  //
+
+  atexit(CleanupOnShutdown);
+}
+
+void CleanupOnShutdown() {}
+
+std::unique_ptr<GraphicsSystem> Create(Emulator* emulator) {
+  InitializeIfNeeded();
+  return std::make_unique<GL4GraphicsSystem>(emulator);
+}
+
+std::unique_ptr<ui::GraphicsContext> GL4GraphicsSystem::CreateContext(
+    ui::Window* target_window) {
+  // Setup the GL control that actually does the drawing.
+  // We run here in the loop and only touch it (and its context) on this
+  // thread. That means some sync-fu when we want to swap.
+  return xe::ui::gl::GLContext::Create(target_window);
+}
+
+GL4GraphicsSystem::GL4GraphicsSystem(Emulator* emulator)
+    : GraphicsSystem(emulator), worker_running_(false) {}
 
 GL4GraphicsSystem::~GL4GraphicsSystem() = default;
 
 X_STATUS GL4GraphicsSystem::Setup(cpu::Processor* processor,
-                                  ui::PlatformLoop* target_loop,
-                                  ui::PlatformWindow* target_window) {
+                                  ui::Loop* target_loop,
+                                  ui::Window* target_window) {
   auto result = GraphicsSystem::Setup(processor, target_loop, target_window);
   if (result) {
     return result;
   }
 
+  display_context_ =
+      reinterpret_cast<xe::ui::gl::GLContext*>(target_window->context());
+
+  // Watch for paint requests to do our swap.
+  target_window->on_painting.AddListener(
+      [this](xe::ui::UIEvent& e) { Swap(e); });
+
   // Create rendering control.
   // This must happen on the UI thread.
-  poly::threading::Fence control_ready_fence;
-  std::unique_ptr<GLContext> processor_context;
-  target_loop_->Post([&]() {
-    // Setup the GL control that actually does the drawing.
-    // We run here in the loop and only touch it (and its context) on this
-    // thread. That means some sync-fu when we want to swap.
-    control_ = std::make_unique<WGLControl>(target_loop_);
-    target_window_->AddChild(control_.get());
-
+  std::unique_ptr<xe::ui::GraphicsContext> processor_context;
+  target_loop_->PostSynchronous([&]() {
     // Setup the GL context the command processor will do all its drawing in.
-    // It's shared with the control context so that we can resolve framebuffers
+    // It's shared with the display context so that we can resolve framebuffers
     // from it.
-    processor_context = control_->context()->CreateShared();
-
-    {
-      GLContextLock context_lock(control_->context());
-      auto profiler_display =
-          std::make_unique<GL4ProfilerDisplay>(control_.get());
-      Profiler::set_display(std::move(profiler_display));
-    }
-
-    control_ready_fence.Signal();
+    processor_context = display_context_->CreateShared();
+    processor_context->ClearCurrent();
   });
-  control_ready_fence.Wait();
+  if (!processor_context) {
+    XEFATAL(
+        "Unable to initialize GL context. Xenia requires OpenGL 4.5. Ensure "
+        "you have the latest drivers for your GPU and that it supports OpenGL "
+        "4.5. See http://xenia.jp/faq/ for more information.");
+    return X_STATUS_UNSUCCESSFUL;
+  }
 
   // Create command processor. This will spin up a thread to process all
   // incoming ringbuffer packets.
   command_processor_ = std::make_unique<CommandProcessor>(this);
   if (!command_processor_->Initialize(std::move(processor_context))) {
-    PLOGE("Unable to initialize command processor");
+    XELOGE("Unable to initialize command processor");
     return X_STATUS_UNSUCCESSFUL;
   }
-  command_processor_->set_swap_handler(
-      [this](const SwapParameters& swap_params) { SwapHandler(swap_params); });
+  command_processor_->set_swap_request_handler(
+      [this]() { target_window_->Invalidate(); });
 
   // Let the processor know we want register access callbacks.
-  memory_->AddMappedRange(
+  memory_->AddVirtualMappedRange(
       0x7FC80000, 0xFFFF0000, 0x0000FFFF, this,
       reinterpret_cast<cpu::MMIOReadCallback>(MMIOReadRegisterThunk),
       reinterpret_cast<cpu::MMIOWriteCallback>(MMIOWriteRegisterThunk));
 
   // 60hz vsync timer.
-  DWORD timer_period = 16;
-  if (!FLAGS_vsync) {
-    // DANGER a value too low here will lead to starvation!
-    timer_period = 4;
-  }
-  timer_queue_ = CreateTimerQueue();
-  CreateTimerQueueTimer(&vsync_timer_, timer_queue_,
-                        (WAITORTIMERCALLBACK)VsyncCallbackThunk, this, 16,
-                        timer_period, WT_EXECUTEINPERSISTENTTHREAD);
+  worker_running_ = true;
+  worker_thread_ =
+      kernel::object_ref<kernel::XHostThread>(new kernel::XHostThread(
+          emulator()->kernel_state(), 128 * 1024, 0, [this]() {
+            uint64_t vsync_duration = FLAGS_vsync ? 16 : 1;
+            uint64_t last_frame_time = Clock::QueryGuestTickCount();
+            while (worker_running_) {
+              uint64_t current_time = Clock::QueryGuestTickCount();
+              uint64_t elapsed = (current_time - last_frame_time) /
+                                 (Clock::guest_tick_frequency() / 1000);
+              if (elapsed >= vsync_duration) {
+                MarkVblank();
+                last_frame_time = current_time;
+              }
+              xe::threading::Sleep(std::chrono::milliseconds::duration(1));
+            }
+            return 0;
+          }));
+  worker_thread_->set_name("GL4 Vsync");
+  worker_thread_->Create();
 
   if (FLAGS_trace_gpu_stream) {
     BeginTracing();
@@ -99,15 +142,15 @@ X_STATUS GL4GraphicsSystem::Setup(cpu::Processor* processor,
 void GL4GraphicsSystem::Shutdown() {
   EndTracing();
 
-  DeleteTimerQueueTimer(timer_queue_, vsync_timer_, nullptr);
-  DeleteTimerQueue(timer_queue_);
+  worker_running_ = false;
+  worker_thread_->Wait(0, 0, 0, nullptr);
+  worker_thread_.reset();
 
   command_processor_->Shutdown();
 
   // TODO(benvanik): remove mapped range.
 
   command_processor_.reset();
-  control_.reset();
 
   GraphicsSystem::Shutdown();
 }
@@ -122,125 +165,120 @@ void GL4GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr,
   command_processor_->EnableReadPointerWriteBack(ptr, block_size);
 }
 
-void GL4GraphicsSystem::RequestSwap() {
-  command_processor_->CallInThread([&]() { command_processor_->IssueSwap(); });
-}
-
 void GL4GraphicsSystem::RequestFrameTrace() {
-  command_processor_->RequestFrameTrace(
-      poly::to_wstring(FLAGS_trace_gpu_prefix));
+  command_processor_->RequestFrameTrace(xe::to_wstring(FLAGS_trace_gpu_prefix));
 }
 
 void GL4GraphicsSystem::BeginTracing() {
-  command_processor_->BeginTracing(poly::to_wstring(FLAGS_trace_gpu_prefix));
+  command_processor_->BeginTracing(xe::to_wstring(FLAGS_trace_gpu_prefix));
 }
 
 void GL4GraphicsSystem::EndTracing() { command_processor_->EndTracing(); }
 
 void GL4GraphicsSystem::PlayTrace(const uint8_t* trace_data, size_t trace_size,
                                   TracePlaybackMode playback_mode) {
-  command_processor_->CallInThread(
-      [this, trace_data, trace_size, playback_mode]() {
-        command_processor_->set_swap_mode(SwapMode::kIgnored);
+  command_processor_->CallInThread([this, trace_data, trace_size,
+                                    playback_mode]() {
+    command_processor_->set_swap_mode(SwapMode::kIgnored);
 
-        auto trace_ptr = trace_data;
-        bool pending_break = false;
-        const PacketStartCommand* pending_packet = nullptr;
-        while (trace_ptr < trace_data + trace_size) {
-          auto type =
-              static_cast<TraceCommandType>(poly::load<uint32_t>(trace_ptr));
-          switch (type) {
-            case TraceCommandType::kPrimaryBufferStart: {
-              auto cmd =
-                  reinterpret_cast<const PrimaryBufferStartCommand*>(trace_ptr);
-              //
-              trace_ptr += sizeof(*cmd) + cmd->count * 4;
-              break;
-            }
-            case TraceCommandType::kPrimaryBufferEnd: {
-              auto cmd =
-                  reinterpret_cast<const PrimaryBufferEndCommand*>(trace_ptr);
-              //
-              trace_ptr += sizeof(*cmd);
-              break;
-            }
-            case TraceCommandType::kIndirectBufferStart: {
-              auto cmd = reinterpret_cast<const IndirectBufferStartCommand*>(
-                  trace_ptr);
-              //
-              trace_ptr += sizeof(*cmd) + cmd->count * 4;
-              break;
-            }
-            case TraceCommandType::kIndirectBufferEnd: {
-              auto cmd =
-                  reinterpret_cast<const IndirectBufferEndCommand*>(trace_ptr);
-              //
-              trace_ptr += sizeof(*cmd);
-              break;
-            }
-            case TraceCommandType::kPacketStart: {
-              auto cmd = reinterpret_cast<const PacketStartCommand*>(trace_ptr);
-              trace_ptr += sizeof(*cmd);
-              std::memcpy(memory()->TranslatePhysical(cmd->base_ptr), trace_ptr,
-                          cmd->count * 4);
-              trace_ptr += cmd->count * 4;
-              pending_packet = cmd;
-              break;
-            }
-            case TraceCommandType::kPacketEnd: {
-              auto cmd = reinterpret_cast<const PacketEndCommand*>(trace_ptr);
-              trace_ptr += sizeof(*cmd);
-              if (pending_packet) {
-                command_processor_->ExecutePacket(pending_packet->base_ptr,
-                                                  pending_packet->count);
-                pending_packet = nullptr;
-              }
-              if (pending_break) {
-                return;
-              }
-              break;
-            }
-            case TraceCommandType::kMemoryRead: {
-              auto cmd = reinterpret_cast<const MemoryReadCommand*>(trace_ptr);
-              trace_ptr += sizeof(*cmd);
-              std::memcpy(memory()->TranslatePhysical(cmd->base_ptr), trace_ptr,
-                          cmd->length);
-              trace_ptr += cmd->length;
-              break;
-            }
-            case TraceCommandType::kMemoryWrite: {
-              auto cmd = reinterpret_cast<const MemoryWriteCommand*>(trace_ptr);
-              trace_ptr += sizeof(*cmd);
-              // ?
-              trace_ptr += cmd->length;
-              break;
-            }
-            case TraceCommandType::kEvent: {
-              auto cmd = reinterpret_cast<const EventCommand*>(trace_ptr);
-              trace_ptr += sizeof(*cmd);
-              switch (cmd->event_type) {
-                case EventType::kSwap: {
-                  if (playback_mode == TracePlaybackMode::kBreakOnSwap) {
-                    pending_break = true;
-                  }
-                  break;
-                }
+    auto trace_ptr = trace_data;
+    bool pending_break = false;
+    const PacketStartCommand* pending_packet = nullptr;
+    while (trace_ptr < trace_data + trace_size) {
+      auto type = static_cast<TraceCommandType>(xe::load<uint32_t>(trace_ptr));
+      switch (type) {
+        case TraceCommandType::kPrimaryBufferStart: {
+          auto cmd =
+              reinterpret_cast<const PrimaryBufferStartCommand*>(trace_ptr);
+          //
+          trace_ptr += sizeof(*cmd) + cmd->count * 4;
+          break;
+        }
+        case TraceCommandType::kPrimaryBufferEnd: {
+          auto cmd =
+              reinterpret_cast<const PrimaryBufferEndCommand*>(trace_ptr);
+          //
+          trace_ptr += sizeof(*cmd);
+          break;
+        }
+        case TraceCommandType::kIndirectBufferStart: {
+          auto cmd =
+              reinterpret_cast<const IndirectBufferStartCommand*>(trace_ptr);
+          //
+          trace_ptr += sizeof(*cmd) + cmd->count * 4;
+          break;
+        }
+        case TraceCommandType::kIndirectBufferEnd: {
+          auto cmd =
+              reinterpret_cast<const IndirectBufferEndCommand*>(trace_ptr);
+          //
+          trace_ptr += sizeof(*cmd);
+          break;
+        }
+        case TraceCommandType::kPacketStart: {
+          auto cmd = reinterpret_cast<const PacketStartCommand*>(trace_ptr);
+          trace_ptr += sizeof(*cmd);
+          std::memcpy(memory()->TranslatePhysical(cmd->base_ptr), trace_ptr,
+                      cmd->count * 4);
+          trace_ptr += cmd->count * 4;
+          pending_packet = cmd;
+          break;
+        }
+        case TraceCommandType::kPacketEnd: {
+          auto cmd = reinterpret_cast<const PacketEndCommand*>(trace_ptr);
+          trace_ptr += sizeof(*cmd);
+          if (pending_packet) {
+            command_processor_->ExecutePacket(pending_packet->base_ptr,
+                                              pending_packet->count);
+            pending_packet = nullptr;
+          }
+          if (pending_break) {
+            return;
+          }
+          break;
+        }
+        case TraceCommandType::kMemoryRead: {
+          auto cmd = reinterpret_cast<const MemoryReadCommand*>(trace_ptr);
+          trace_ptr += sizeof(*cmd);
+          std::memcpy(memory()->TranslatePhysical(cmd->base_ptr), trace_ptr,
+                      cmd->length);
+          trace_ptr += cmd->length;
+          break;
+        }
+        case TraceCommandType::kMemoryWrite: {
+          auto cmd = reinterpret_cast<const MemoryWriteCommand*>(trace_ptr);
+          trace_ptr += sizeof(*cmd);
+          // ?
+          trace_ptr += cmd->length;
+          break;
+        }
+        case TraceCommandType::kEvent: {
+          auto cmd = reinterpret_cast<const EventCommand*>(trace_ptr);
+          trace_ptr += sizeof(*cmd);
+          switch (cmd->event_type) {
+            case EventType::kSwap: {
+              if (playback_mode == TracePlaybackMode::kBreakOnSwap) {
+                pending_break = true;
               }
               break;
             }
           }
+          break;
         }
+      }
+    }
 
-        command_processor_->set_swap_mode(SwapMode::kNormal);
-      });
+    command_processor_->set_swap_mode(SwapMode::kNormal);
+    command_processor_->IssueSwap(0, 1280, 720);
+  });
+}
+
+void GL4GraphicsSystem::ClearCaches() {
+  command_processor_->CallInThread(
+      [&]() { command_processor_->ClearCaches(); });
 }
 
 void GL4GraphicsSystem::MarkVblank() {
-  static bool thread_name_set = false;
-  if (!thread_name_set) {
-    thread_name_set = true;
-    Profiler::ThreadEnter("GL4 Vsync Timer");
-  }
   SCOPE_profile_cpu_f("gpu");
 
   // Increment vblank counter (so the game sees us making progress).
@@ -252,25 +290,32 @@ void GL4GraphicsSystem::MarkVblank() {
   DispatchInterruptCallback(0, 2);
 }
 
-void GL4GraphicsSystem::SwapHandler(const SwapParameters& swap_params) {
-  SCOPE_profile_cpu_f("gpu");
-
-  // Swap requested. Synchronously post a request to the loop so that
-  // we do the swap in the right thread.
-  control_->SynchronousRepaint([&]() {
-    if (!swap_params.framebuffer_texture) {
-      // no-op.
-      return;
+void GL4GraphicsSystem::Swap(xe::ui::UIEvent& e) {
+  // Check for pending swap.
+  auto& swap_state = command_processor_->swap_state();
+  {
+    std::lock_guard<xe::mutex> lock(swap_state.mutex);
+    if (swap_state.pending) {
+      swap_state.pending = false;
+      std::swap(swap_state.front_buffer_texture,
+                swap_state.back_buffer_texture);
     }
-    Rect2D src_rect(swap_params.x, swap_params.y, swap_params.width,
-                    swap_params.height);
-    Rect2D dest_rect(0, 0, control_->width(), control_->height());
-    control_->context()->blitter()->BlitTexture2D(
-        swap_params.framebuffer_texture, src_rect, dest_rect, GL_LINEAR);
-  });
+  }
+
+  if (!swap_state.front_buffer_texture) {
+    // Not yet ready.
+    return;
+  }
+
+  // Blit the frontbuffer.
+  display_context_->blitter()->BlitTexture2D(
+      swap_state.front_buffer_texture,
+      Rect2D(0, 0, swap_state.width, swap_state.height),
+      Rect2D(0, 0, target_window_->width(), target_window_->height()),
+      GL_LINEAR);
 }
 
-uint64_t GL4GraphicsSystem::ReadRegister(uint64_t addr) {
+uint64_t GL4GraphicsSystem::ReadRegister(uint32_t addr) {
   uint32_t r = addr & 0xFFFF;
 
   switch (r) {
@@ -286,11 +331,11 @@ uint64_t GL4GraphicsSystem::ReadRegister(uint64_t addr) {
       return 0x050002D0;
   }
 
-  assert_true(r >= 0 && r < RegisterFile::kRegisterCount);
+  assert_true(r < RegisterFile::kRegisterCount);
   return register_file_.values[r].u32;
 }
 
-void GL4GraphicsSystem::WriteRegister(uint64_t addr, uint64_t value) {
+void GL4GraphicsSystem::WriteRegister(uint32_t addr, uint64_t value) {
   uint32_t r = addr & 0xFFFF;
 
   switch (r) {
@@ -305,7 +350,7 @@ void GL4GraphicsSystem::WriteRegister(uint64_t addr, uint64_t value) {
       break;
   }
 
-  assert_true(r >= 0 && r < RegisterFile::kRegisterCount);
+  assert_true(r < RegisterFile::kRegisterCount);
   register_file_.values[r].u32 = static_cast<uint32_t>(value);
 }
 

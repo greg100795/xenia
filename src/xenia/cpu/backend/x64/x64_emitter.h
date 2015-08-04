@@ -10,20 +10,27 @@
 #ifndef XENIA_BACKEND_X64_X64_EMITTER_H_
 #define XENIA_BACKEND_X64_X64_EMITTER_H_
 
+#include <vector>
+
+#include "xenia/base/arena.h"
+#include "xenia/cpu/function.h"
+#include "xenia/cpu/hir/hir_builder.h"
+#include "xenia/cpu/hir/instr.h"
 #include "xenia/cpu/hir/value.h"
-#include "poly/arena.h"
+#include "xenia/cpu/symbol_info.h"
+#include "xenia/debug/function_trace_data.h"
+#include "xenia/memory.h"
+
+// NOTE: must be included last as it expects windows.h to already be included.
 #include "third_party/xbyak/xbyak/xbyak.h"
+#include "third_party/xbyak/xbyak/xbyak_util.h"
 
 namespace xe {
 namespace cpu {
 class DebugInfo;
 class FunctionInfo;
-class Runtime;
+class Processor;
 class SymbolInfo;
-namespace hir {
-class HIRBuilder;
-class Instr;
-}  // namespace hir
 }  // namespace cpu
 }  // namespace xe
 
@@ -31,8 +38,6 @@ namespace xe {
 namespace cpu {
 namespace backend {
 namespace x64 {
-
-using vec128_t = poly::vec128_t;
 
 class X64Backend;
 class X64CodeCache;
@@ -96,19 +101,29 @@ class XbyakAllocator : public Xbyak::Allocator {
   virtual bool useProtect() const { return false; }
 };
 
+enum X64EmitterFeatureFlags {
+  kX64EmitAVX2 = 1 << 1,
+  kX64EmitFMA = 1 << 2,
+  kX64EmitLZCNT = 1 << 3,
+  kX64EmitBMI2 = 1 << 4,
+  kX64EmitF16C = 1 << 5,
+  kX64EmitMovbe = 1 << 6,
+};
+
 class X64Emitter : public Xbyak::CodeGenerator {
  public:
   X64Emitter(X64Backend* backend, XbyakAllocator* allocator);
   virtual ~X64Emitter();
 
-  Runtime* runtime() const { return runtime_; }
+  Processor* processor() const { return processor_; }
   X64Backend* backend() const { return backend_; }
 
-  int Initialize();
+  bool Emit(FunctionInfo* function_info, hir::HIRBuilder* builder,
+            uint32_t debug_info_flags, DebugInfo* debug_info,
+            void*& out_code_address, size_t& out_code_size,
+            std::vector<SourceMapEntry>& out_source_map);
 
-  int Emit(hir::HIRBuilder* builder, uint32_t debug_info_flags,
-           DebugInfo* debug_info, uint32_t trace_flags, void*& out_code_address,
-           size_t& out_code_size);
+  static uint32_t PlaceData(Memory* memory);
 
  public:
   // Reserved:  rsp
@@ -140,12 +155,13 @@ class X64Emitter : public Xbyak::CodeGenerator {
     r = Xbyak::Xmm(idx);
   }
 
+  Xbyak::Label& epilog_label() { return *epilog_label_; }
+
   void MarkSourceOffset(const hir::Instr* i);
 
   void DebugBreak();
   void Trap(uint16_t trap_type = 0);
   void UnimplementedInstr(const hir::Instr* i);
-  void UnimplementedExtern(const hir::Instr* i);
 
   void Call(const hir::Instr* instr, FunctionInfo* symbol_info);
   void CallIndirect(const hir::Instr* instr, const Xbyak::Reg64& reg);
@@ -164,9 +180,6 @@ class X64Emitter : public Xbyak::CodeGenerator {
 
   // TODO(benvanik): Label for epilog (don't use strings).
 
-  void LoadEflags();
-  void StoreEflags();
-
   // Moves a 64bit immediate into memory.
   bool ConstantFitsIn32Reg(uint64_t v);
   void MovMem64(const Xbyak::RegExp& addr, uint64_t v);
@@ -177,30 +190,37 @@ class X64Emitter : public Xbyak::CodeGenerator {
   void LoadConstantXmm(Xbyak::Xmm dest, const vec128_t& v);
   Xbyak::Address StashXmm(int index, const Xbyak::Xmm& r);
 
+  bool IsFeatureEnabled(uint32_t feature_flag) const {
+    return (feature_flags_ & feature_flag) != 0;
+  }
+
+  DebugInfo* debug_info() const { return debug_info_; }
+
   size_t stack_size() const { return stack_size_; }
 
  protected:
-  void* Emplace(size_t stack_size);
-  int Emit(hir::HIRBuilder* builder, size_t& out_stack_size);
-  void EmitTraceSource(const hir::Instr* instr);
-  void EmitTraceSourceAppendValue(const hir::Value* value, size_t r8_offset);
+  void* Emplace(size_t stack_size, FunctionInfo* function_info = nullptr);
+  bool Emit(hir::HIRBuilder* builder, size_t& out_stack_size);
   void EmitGetCurrentThreadId();
   void EmitTraceUserCallReturn();
 
  protected:
-  Runtime* runtime_;
-  X64Backend* backend_;
-  X64CodeCache* code_cache_;
-  XbyakAllocator* allocator_;
+  Processor* processor_ = nullptr;
+  X64Backend* backend_ = nullptr;
+  X64CodeCache* code_cache_ = nullptr;
+  XbyakAllocator* allocator_ = nullptr;
+  Xbyak::util::Cpu cpu_;
+  uint32_t feature_flags_ = 0;
 
-  hir::Instr* current_instr_;
+  Xbyak::Label* epilog_label_ = nullptr;
 
-  size_t source_map_count_;
-  poly::Arena source_map_arena_;
+  hir::Instr* current_instr_ = nullptr;
 
-  size_t stack_size_;
+  DebugInfo* debug_info_ = nullptr;
+  uint32_t debug_info_flags_ = 0;
+  Arena source_map_arena_;
 
-  uint32_t trace_flags_;
+  size_t stack_size_ = 0;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t xmm_reg_map_[XMM_COUNT];

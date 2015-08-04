@@ -12,9 +12,10 @@
 #include <sstream>
 #include <vector>
 
+#include "xenia/base/assert.h"
+#include "xenia/base/math.h"
+#include "xenia/base/string_buffer.h"
 #include "xenia/cpu/frontend/ppc_instr_tables.h"
-#include "poly/poly.h"
-#include "poly/string_buffer.h"
 
 namespace xe {
 namespace cpu {
@@ -23,14 +24,15 @@ namespace frontend {
 std::vector<InstrType*> all_instrs_;
 
 void DumpAllInstrCounts() {
-  poly::StringBuffer sb;
+  StringBuffer sb;
   sb.Append("Instruction translation counts:\n");
   for (auto instr_type : all_instrs_) {
     if (instr_type->translation_count) {
-      sb.Append("%8d : %s\n", instr_type->translation_count, instr_type->name);
+      sb.AppendFormat("%8d : %s\n", instr_type->translation_count,
+                      instr_type->name);
     }
   }
-  fprintf(stdout, sb.GetString());
+  fprintf(stdout, "%s", sb.GetString());
   fflush(stdout);
 }
 
@@ -41,7 +43,7 @@ void InstrOperand::Dump(std::string& out_str) {
   }
 
   char buffer[32];
-  const size_t max_count = poly::countof(buffer);
+  const size_t max_count = xe::countof(buffer);
   switch (type) {
     case InstrOperand::kRegister:
       switch (reg.set) {
@@ -75,14 +77,14 @@ void InstrOperand::Dump(std::string& out_str) {
       switch (imm.width) {
         case 1:
           if (imm.is_signed) {
-            snprintf(buffer, max_count, "%d", (int32_t)(int8_t) imm.value);
+            snprintf(buffer, max_count, "%d", (int32_t)(int8_t)imm.value);
           } else {
             snprintf(buffer, max_count, "0x%.2X", (uint8_t)imm.value);
           }
           break;
         case 2:
           if (imm.is_signed) {
-            snprintf(buffer, max_count, "%d", (int32_t)(int16_t) imm.value);
+            snprintf(buffer, max_count, "%d", (int32_t)(int16_t)imm.value);
           } else {
             snprintf(buffer, max_count, "0x%.4X", (uint16_t)imm.value);
           }
@@ -293,10 +295,11 @@ void InstrAccessBits::Dump(std::string& out_str) {
   out_str = str.str();
 }
 
-void InstrDisasm::Init(const char* name, const char* info, uint32_t flags) {
-  this->name = name;
-  this->info = info;
-  this->flags = flags;
+void InstrDisasm::Init(const char* new_name, const char* new_info,
+                       uint32_t new_flags) {
+  name = new_name;
+  info = new_info;
+  flags = new_flags;
 }
 
 void InstrDisasm::AddLR(InstrRegister::Access access) {}
@@ -379,7 +382,7 @@ InstrType* GetInstrType(uint32_t code) {
 
   // Slow lookup via linear scan.
   // This is primarily due to laziness. It could be made fast like the others.
-  for (size_t n = 0; n < poly::countof(tables::instr_table_scan); n++) {
+  for (size_t n = 0; n < xe::countof(tables::instr_table_scan); n++) {
     slot = &(tables::instr_table_scan[n]);
     if (slot->opcode == (code & slot->opcode_mask)) {
       return slot;

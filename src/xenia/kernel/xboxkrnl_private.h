@@ -10,7 +10,6 @@
 #ifndef XENIA_KERNEL_XBOXKRNL_PRIVATE_H_
 #define XENIA_KERNEL_XBOXKRNL_PRIVATE_H_
 
-#include "xenia/common.h"
 #include "xenia/kernel/xboxkrnl_ordinals.h"
 
 namespace xe {
@@ -18,24 +17,42 @@ namespace kernel {
 
 class KernelState;
 
+xe::cpu::Export* RegisterExport_xboxkrnl(xe::cpu::Export* export_entry);
+
 namespace xboxkrnl {
 // Registration functions, one per file.
-void RegisterAudioExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterAudioXmaExports(ExportResolver* export_resolver,
-                             KernelState* state);
-void RegisterDebugExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterHalExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterIoExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterMemoryExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterMiscExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterModuleExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterObExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterRtlExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterStringExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterThreadingExports(ExportResolver* export_resolver,
-                              KernelState* state);
-void RegisterUsbcamExports(ExportResolver* export_resolver, KernelState* state);
-void RegisterVideoExports(ExportResolver* export_resolver, KernelState* state);
+void RegisterAudioExports(xe::cpu::ExportResolver* export_resolver,
+                          KernelState* kernel_state);
+void RegisterAudioXmaExports(xe::cpu::ExportResolver* export_resolver,
+                             KernelState* kernel_state);
+void RegisterCryptExports(xe::cpu::ExportResolver* export_resolver,
+                          KernelState* kernel_state);
+void RegisterDebugExports(xe::cpu::ExportResolver* export_resolver,
+                          KernelState* kernel_state);
+void RegisterErrorExports(xe::cpu::ExportResolver* export_resolver,
+                          KernelState* kernel_state);
+void RegisterHalExports(xe::cpu::ExportResolver* export_resolver,
+                        KernelState* kernel_state);
+void RegisterIoExports(xe::cpu::ExportResolver* export_resolver,
+                       KernelState* kernel_state);
+void RegisterMemoryExports(xe::cpu::ExportResolver* export_resolver,
+                           KernelState* kernel_state);
+void RegisterMiscExports(xe::cpu::ExportResolver* export_resolver,
+                         KernelState* kernel_state);
+void RegisterModuleExports(xe::cpu::ExportResolver* export_resolver,
+                           KernelState* kernel_state);
+void RegisterObExports(xe::cpu::ExportResolver* export_resolver,
+                       KernelState* kernel_state);
+void RegisterRtlExports(xe::cpu::ExportResolver* export_resolver,
+                        KernelState* kernel_state);
+void RegisterStringExports(xe::cpu::ExportResolver* export_resolver,
+                           KernelState* kernel_state);
+void RegisterThreadingExports(xe::cpu::ExportResolver* export_resolver,
+                              KernelState* kernel_state);
+void RegisterUsbcamExports(xe::cpu::ExportResolver* export_resolver,
+                           KernelState* kernel_state);
+void RegisterVideoExports(xe::cpu::ExportResolver* export_resolver,
+                          KernelState* kernel_state);
 }  // namespace xboxkrnl
 
 }  // namespace kernel

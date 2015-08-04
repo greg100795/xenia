@@ -9,12 +9,14 @@
 
 #include "xenia/gpu/register_file.h"
 
-#include "poly/math.h"
+#include <cstring>
+
+#include "xenia/base/math.h"
 
 namespace xe {
 namespace gpu {
 
-RegisterFile::RegisterFile() { memset(values, 0, sizeof(values)); }
+RegisterFile::RegisterFile() { std::memset(values, 0, sizeof(values)); }
 
 const RegisterInfo* RegisterFile::GetRegisterInfo(uint32_t index) {
   switch (index) {
@@ -24,8 +26,7 @@ const RegisterInfo* RegisterFile::GetRegisterInfo(uint32_t index) {
         RegisterInfo::Type::type, #name,   \
     };                                     \
     return &reg_info;                      \
-  \
-}
+  }
 #include "xenia/gpu/register_table.inc"
 #undef XE_GPU_REGISTER
     default:

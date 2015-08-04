@@ -9,9 +9,11 @@
 
 #include "xenia/cpu/compiler/passes/data_flow_analysis_pass.h"
 
+#include "xenia/base/assert.h"
+#include "xenia/base/platform.h"
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/compiler/compiler.h"
-#include "xenia/cpu/runtime.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/profiling.h"
 
 #if XE_COMPILER_MSVC
@@ -40,20 +42,20 @@ DataFlowAnalysisPass::DataFlowAnalysisPass() : CompilerPass() {}
 
 DataFlowAnalysisPass::~DataFlowAnalysisPass() {}
 
-int DataFlowAnalysisPass::Run(HIRBuilder* builder) {
+bool DataFlowAnalysisPass::Run(HIRBuilder* builder) {
   // Linearize blocks so that we can detect cycles and propagate dependencies.
   uint32_t block_count = LinearizeBlocks(builder);
 
   // Analyze value flow and add locals as needed.
   AnalyzeFlow(builder, block_count);
 
-  return 0;
+  return true;
 }
 
 uint32_t DataFlowAnalysisPass::LinearizeBlocks(HIRBuilder* builder) {
   // TODO(benvanik): actually do this - we cheat now knowing that they are in
   //     sequential order.
-  uint32_t block_ordinal = 0;
+  uint16_t block_ordinal = 0;
   auto block = builder->first_block();
   while (block) {
     block->ordinal = block_ordinal++;

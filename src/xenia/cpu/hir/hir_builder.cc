@@ -9,26 +9,44 @@
 
 #include "xenia/cpu/hir/hir_builder.h"
 
+#include <cstdarg>
+#include <cstring>
+
+#include "xenia/base/assert.h"
 #include "xenia/cpu/hir/block.h"
 #include "xenia/cpu/hir/instr.h"
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/symbol_info.h"
 #include "xenia/profiling.h"
 
+// Will scribble arena memory to hopefully find use before clears.
+//#define SCRIBBLE_ARENA_ON_RESET
+
 namespace xe {
 namespace cpu {
 namespace hir {
 
-#define ASSERT_ADDRESS_TYPE(value)
-#define ASSERT_INTEGER_TYPE(value)
-#define ASSERT_FLOAT_TYPE(value)
-#define ASSERT_NON_VECTOR_TYPE(value)
-#define ASSERT_VECTOR_TYPE(value)
+#define ASSERT_ADDRESS_TYPE(value) \
+  assert_true((value->type) == INT32_TYPE || (value->type) == INT64_TYPE)
+#define ASSERT_CALL_ADDRESS_TYPE(value) \
+  assert_true((value->type) == INT32_TYPE || (value->type) == INT64_TYPE)
+#define ASSERT_INTEGER_TYPE(value)                                         \
+  assert_true((value->type) == INT8_TYPE || (value->type) == INT16_TYPE || \
+              (value->type) == INT32_TYPE || (value->type) == INT64_TYPE)
+#define ASSERT_FLOAT_TYPE(value) \
+  assert_true((value->type) == FLOAT32_TYPE || (value->type) == FLOAT64_TYPE)
+#define ASSERT_NON_FLOAT_TYPE(value) \
+  assert_true((value->type) != FLOAT32_TYPE && (value->type) != FLOAT64_TYPE)
+#define ASSERT_NON_VECTOR_TYPE(value) assert_false((value->type) == VEC128_TYPE)
+#define ASSERT_VECTOR_TYPE(value) assert_true((value->type) == VEC128_TYPE)
+#define ASSERT_FLOAT_OR_VECTOR_TYPE(value)     \
+  assert_true((value->type) == FLOAT32_TYPE || \
+              (value->type) == FLOAT64_TYPE || (value->type) == VEC128_TYPE)
 #define ASSERT_TYPES_EQUAL(value1, value2) \
   assert_true((value1->type) == (value2->type))
 
 HIRBuilder::HIRBuilder() {
-  arena_ = new poly::Arena();
+  arena_ = new Arena();
   Reset();
 }
 
@@ -44,13 +62,13 @@ void HIRBuilder::Reset() {
   locals_.clear();
   block_head_ = block_tail_ = NULL;
   current_block_ = NULL;
-#if XE_DEBUG
+#if SCRIBBLE_ARENA_ON_RESET
   arena_->DebugFill();
 #endif
   arena_->Reset();
 }
 
-int HIRBuilder::Finalize() {
+bool HIRBuilder::Finalize() {
   // Scan blocks in order and add fallthrough branches. These are needed for
   // analysis passes to work. We may have also added blocks out of order and
   // need to ensure they fall through in the right order.
@@ -83,34 +101,34 @@ int HIRBuilder::Finalize() {
       current_block_ = NULL;
     }
   }
-  return 0;
+  return true;
 }
 
-void HIRBuilder::DumpValue(poly::StringBuffer* str, Value* value) {
+void HIRBuilder::DumpValue(StringBuffer* str, Value* value) {
   if (value->IsConstant()) {
     switch (value->type) {
       case INT8_TYPE:
-        str->Append("%X", value->constant.i8);
+        str->AppendFormat("%X", value->constant.i8);
         break;
       case INT16_TYPE:
-        str->Append("%X", value->constant.i16);
+        str->AppendFormat("%X", value->constant.i16);
         break;
       case INT32_TYPE:
-        str->Append("%X", value->constant.i32);
+        str->AppendFormat("%X", value->constant.i32);
         break;
       case INT64_TYPE:
-        str->Append("%llX", value->constant.i64);
+        str->AppendFormat("%llX", value->constant.i64);
         break;
       case FLOAT32_TYPE:
-        str->Append("%F", value->constant.f32);
+        str->AppendFormat("%F", value->constant.f32);
         break;
       case FLOAT64_TYPE:
-        str->Append("%F", value->constant.f64);
+        str->AppendFormat("%F", value->constant.f64);
         break;
       case VEC128_TYPE:
-        str->Append("(%F,%F,%F,%F)", value->constant.v128.x,
-                    value->constant.v128.y, value->constant.v128.z,
-                    value->constant.v128.w);
+        str->AppendFormat("(%F,%F,%F,%F)", value->constant.v128.x,
+                          value->constant.v128.y, value->constant.v128.z,
+                          value->constant.v128.w);
         break;
       default:
         assert_always();
@@ -120,14 +138,14 @@ void HIRBuilder::DumpValue(poly::StringBuffer* str, Value* value) {
     static const char* type_names[] = {
         "i8", "i16", "i32", "i64", "f32", "f64", "v128",
     };
-    str->Append("v%d.%s", value->ordinal, type_names[value->type]);
+    str->AppendFormat("v%d.%s", value->ordinal, type_names[value->type]);
   }
   if (value->reg.index != -1) {
-    str->Append("<%s%d>", value->reg.set->name, value->reg.index);
+    str->AppendFormat("<%s%d>", value->reg.set->name, value->reg.index);
   }
 }
 
-void HIRBuilder::DumpOp(poly::StringBuffer* str, OpcodeSignatureType sig_type,
+void HIRBuilder::DumpOp(StringBuffer* str, OpcodeSignatureType sig_type,
                         Instr::Op* op) {
   switch (sig_type) {
     case OPCODE_SIG_TYPE_X:
@@ -136,11 +154,11 @@ void HIRBuilder::DumpOp(poly::StringBuffer* str, OpcodeSignatureType sig_type,
       if (op->label->name) {
         str->Append(op->label->name);
       } else {
-        str->Append("label%d", op->label->id);
+        str->AppendFormat("label%d", op->label->id);
       }
       break;
     case OPCODE_SIG_TYPE_O:
-      str->Append("+%lld", op->offset);
+      str->AppendFormat("+%lld", op->offset);
       break;
     case OPCODE_SIG_TYPE_S:
       if (true) {
@@ -154,16 +172,16 @@ void HIRBuilder::DumpOp(poly::StringBuffer* str, OpcodeSignatureType sig_type,
   }
 }
 
-void HIRBuilder::Dump(poly::StringBuffer* str) {
+void HIRBuilder::Dump(StringBuffer* str) {
   if (attributes_) {
-    str->Append("; attributes = %.8X\n", attributes_);
+    str->AppendFormat("; attributes = %.8X\n", attributes_);
   }
 
   for (auto it = locals_.begin(); it != locals_.end(); ++it) {
     auto local = *it;
     str->Append("  ; local ");
     DumpValue(str, local);
-    str->Append("\n");
+    str->Append('\n');
   }
 
   uint32_t block_ordinal = 0;
@@ -172,16 +190,16 @@ void HIRBuilder::Dump(poly::StringBuffer* str) {
     if (block == block_head_) {
       str->Append("<entry>:\n");
     } else if (!block->label_head) {
-      str->Append("<block%d>:\n", block_ordinal);
+      str->AppendFormat("<block%d>:\n", block_ordinal);
     }
     block_ordinal++;
 
     Label* label = block->label_head;
     while (label) {
       if (label->name) {
-        str->Append("%s:\n", label->name);
+        str->AppendFormat("%s:\n", label->name);
       } else {
-        str->Append("label%d:\n", label->id);
+        str->AppendFormat("label%d:\n", label->id);
       }
       label = label->next;
     }
@@ -190,30 +208,30 @@ void HIRBuilder::Dump(poly::StringBuffer* str) {
     while (incoming_edge) {
       auto src_label = incoming_edge->src->label_head;
       if (src_label && src_label->name) {
-        str->Append("  ; in: %s", src_label->name);
+        str->AppendFormat("  ; in: %s", src_label->name);
       } else if (src_label) {
-        str->Append("  ; in: label%d", src_label->id);
+        str->AppendFormat("  ; in: label%d", src_label->id);
       } else {
-        str->Append("  ; in: <block%d>", incoming_edge->src->ordinal);
+        str->AppendFormat("  ; in: <block%d>", incoming_edge->src->ordinal);
       }
-      str->Append(", dom:%d, uncond:%d\n",
-                  (incoming_edge->flags & Edge::DOMINATES) ? 1 : 0,
-                  (incoming_edge->flags & Edge::UNCONDITIONAL) ? 1 : 0);
+      str->AppendFormat(", dom:%d, uncond:%d\n",
+                        (incoming_edge->flags & Edge::DOMINATES) ? 1 : 0,
+                        (incoming_edge->flags & Edge::UNCONDITIONAL) ? 1 : 0);
       incoming_edge = incoming_edge->incoming_next;
     }
     Edge* outgoing_edge = block->outgoing_edge_head;
     while (outgoing_edge) {
       auto dest_label = outgoing_edge->dest->label_head;
       if (dest_label && dest_label->name) {
-        str->Append("  ; out: %s", dest_label->name);
+        str->AppendFormat("  ; out: %s", dest_label->name);
       } else if (dest_label) {
-        str->Append("  ; out: label%d", dest_label->id);
+        str->AppendFormat("  ; out: label%d", dest_label->id);
       } else {
-        str->Append("  ; out: <block%d>", outgoing_edge->dest->ordinal);
+        str->AppendFormat("  ; out: <block%d>", outgoing_edge->dest->ordinal);
       }
-      str->Append(", dom:%d, uncond:%d\n",
-                  (outgoing_edge->flags & Edge::DOMINATES) ? 1 : 0,
-                  (outgoing_edge->flags & Edge::UNCONDITIONAL) ? 1 : 0);
+      str->AppendFormat(", dom:%d, uncond:%d\n",
+                        (outgoing_edge->flags & Edge::DOMINATES) ? 1 : 0,
+                        (outgoing_edge->flags & Edge::UNCONDITIONAL) ? 1 : 0);
       outgoing_edge = outgoing_edge->outgoing_next;
     }
 
@@ -224,7 +242,7 @@ void HIRBuilder::Dump(poly::StringBuffer* str) {
         continue;
       }
       if (i->opcode == &OPCODE_COMMENT_info) {
-        str->Append("  ; %s\n", (char*)i->src1.offset);
+        str->AppendFormat("  ; %s\n", (char*)i->src1.offset);
         i = i->next;
         continue;
       }
@@ -240,12 +258,12 @@ void HIRBuilder::Dump(poly::StringBuffer* str) {
         str->Append(" = ");
       }
       if (i->flags) {
-        str->Append("%s.%d", info->name, i->flags);
+        str->AppendFormat("%s.%d", info->name, i->flags);
       } else {
-        str->Append("%s", info->name);
+        str->Append(info->name);
       }
       if (src1_type) {
-        str->Append(" ");
+        str->Append(' ');
         DumpOp(str, src1_type, &i->src1);
       }
       if (src2_type) {
@@ -256,7 +274,7 @@ void HIRBuilder::Dump(poly::StringBuffer* str) {
         str->Append(", ");
         DumpOp(str, src3_type, &i->src3);
       }
-      str->Append("\n");
+      str->Append('\n');
       i = i->next;
     }
 
@@ -366,6 +384,8 @@ void HIRBuilder::InsertLabel(Label* label, Instr* prev_instr) {
   Block* next_block = prev_instr->block->next;
 
   Block* new_block = arena_->Alloc<Block>();
+  new_block->ordinal = UINT16_MAX;
+  new_block->incoming_values = nullptr;
   new_block->arena = arena_;
   new_block->prev = prev_block;
   new_block->next = next_block;
@@ -420,16 +440,96 @@ void HIRBuilder::ResetLabelTags() {
 }
 
 void HIRBuilder::AddEdge(Block* src, Block* dest, uint32_t flags) {
+  bool dest_was_dominated =
+      dest->incoming_edge_head && !dest->incoming_edge_head->incoming_next;
+
   Edge* edge = arena_->Alloc<Edge>();
   edge->src = src;
   edge->dest = dest;
   edge->flags = flags;
-  edge->outgoing_prev = NULL;
+  edge->outgoing_prev = nullptr;
   edge->outgoing_next = src->outgoing_edge_head;
+  if (edge->outgoing_next) {
+    edge->outgoing_next->outgoing_prev = edge;
+  }
   src->outgoing_edge_head = edge;
-  edge->incoming_prev = NULL;
+  edge->incoming_prev = nullptr;
   edge->incoming_next = dest->incoming_edge_head;
+  if (edge->incoming_next) {
+    edge->incoming_next->incoming_prev = edge;
+  }
   dest->incoming_edge_head = edge;
+
+  if (dest_was_dominated) {
+    // If dest was previously dominated it no longer is.
+    auto incoming_edge = dest->incoming_edge_head;
+    while (incoming_edge) {
+      incoming_edge->flags &= ~Edge::DOMINATES;
+      incoming_edge = incoming_edge->incoming_next;
+    }
+  }
+}
+
+void HIRBuilder::RemoveEdge(Block* src, Block* dest) {
+  auto edge = src->outgoing_edge_head;
+  while (edge) {
+    if (edge->dest == dest) {
+      RemoveEdge(edge);
+      break;
+    }
+    edge = edge->outgoing_next;
+  }
+}
+
+void HIRBuilder::RemoveEdge(Edge* edge) {
+  if (edge->outgoing_prev) {
+    edge->outgoing_prev->outgoing_next = edge->outgoing_next;
+  }
+  if (edge->outgoing_next) {
+    edge->outgoing_next->outgoing_prev = edge->outgoing_prev;
+  }
+  if (edge == edge->src->outgoing_edge_head) {
+    edge->src->outgoing_edge_head = edge->outgoing_next;
+  }
+  if (edge->incoming_prev) {
+    edge->incoming_prev->incoming_next = edge->incoming_next;
+  }
+  if (edge->incoming_next) {
+    edge->incoming_next->incoming_prev = edge->incoming_prev;
+  }
+  if (edge == edge->dest->incoming_edge_head) {
+    edge->dest->incoming_edge_head = edge->incoming_next;
+  }
+  edge->incoming_next = edge->incoming_prev = nullptr;
+  edge->outgoing_next = edge->outgoing_prev = nullptr;
+
+  if (edge->dest->incoming_edge_head &&
+      !edge->dest->incoming_edge_head->incoming_next) {
+    // Dest is now dominated by the last remaining edge.
+    edge->dest->incoming_edge_head->flags |= Edge::DOMINATES;
+  }
+}
+
+void HIRBuilder::RemoveBlock(Block* block) {
+  while (block->incoming_edge_head) {
+    RemoveEdge(block->incoming_edge_head);
+  }
+  while (block->outgoing_edge_head) {
+    RemoveEdge(block->outgoing_edge_head);
+  }
+  if (block->prev) {
+    block->prev->next = block->next;
+  }
+  if (block->next) {
+    block->next->prev = block->prev;
+  }
+  if (block == block_head_) {
+    block_head_ = block->next;
+  }
+  if (block == block_tail_) {
+    block_tail_ = block->prev;
+  }
+  block->next = block->prev = nullptr;
 }
 
 void HIRBuilder::MergeAdjacentBlocks(Block* left, Block* right) {
@@ -468,7 +568,7 @@ void HIRBuilder::MergeAdjacentBlocks(Block* left, Block* right) {
     }
     left->instr_tail = instr;
 
-    // Unlink from old block list;
+    // Unlink from old block list.
     right->instr_head = next;
     if (right->instr_tail == instr) {
       right->instr_tail = nullptr;
@@ -504,6 +604,19 @@ void HIRBuilder::MergeAdjacentBlocks(Block* left, Block* right) {
     label->next = nullptr;
   }
 
+  // Remove edge between left and right.
+  RemoveEdge(left, right);
+
+  // Move right's outgoing edges to left.
+  assert_null(right->incoming_edge_head);
+  auto edge = right->outgoing_edge_head;
+  while (edge) {
+    auto next_edge = edge->outgoing_next;
+    RemoveEdge(edge);
+    AddEdge(left, edge->dest, edge->flags);
+    edge = next_edge;
+  }
+
   // Remove the right block from the block list.
   left->next = right->next;
   if (right->next) {
@@ -516,6 +629,8 @@ void HIRBuilder::MergeAdjacentBlocks(Block* left, Block* right) {
 
 Block* HIRBuilder::AppendBlock() {
   Block* block = arena_->Alloc<Block>();
+  block->ordinal = UINT16_MAX;
+  block->incoming_values = nullptr;
   block->arena = arena_;
   block->next = NULL;
   block->prev = block_tail_;
@@ -571,7 +686,7 @@ Instr* HIRBuilder::AppendInstr(const OpcodeInfo& opcode_info, uint16_t flags,
   if (!block->instr_head) {
     block->instr_head = instr;
   }
-  instr->ordinal = -1;
+  instr->ordinal = UINT32_MAX;
   instr->block = block;
   instr->opcode = &opcode_info;
   instr->flags = flags;
@@ -617,18 +732,38 @@ Value* HIRBuilder::CloneValue(Value* source) {
   return value;
 }
 
-void HIRBuilder::Comment(const char* format, ...) {
-  char buffer[1024];
-  va_list args;
-  va_start(args, format);
-  vsnprintf(buffer, 1024, format, args);
-  va_end(args);
-  size_t len = strlen(buffer);
-  if (!len) {
+void HIRBuilder::Comment(const char* value) {
+  size_t length = std::strlen(value);
+  if (!length) {
     return;
   }
-  void* p = arena_->Alloc(len + 1);
-  memcpy(p, buffer, len + 1);
+  void* p = arena_->Alloc(length + 1);
+  std::memcpy(p, value, length + 1);
+  Instr* i = AppendInstr(OPCODE_COMMENT_info, 0);
+  i->src1.offset = (uint64_t)p;
+  i->src2.value = i->src3.value = NULL;
+}
+
+void HIRBuilder::Comment(const StringBuffer& value) {
+  if (!value.length()) {
+    return;
+  }
+  void* p = arena_->Alloc(value.length() + 1);
+  std::memcpy(p, value.GetString(), value.length() + 1);
+  Instr* i = AppendInstr(OPCODE_COMMENT_info, 0);
+  i->src1.offset = (uint64_t)p;
+  i->src2.value = i->src3.value = NULL;
+}
+
+void HIRBuilder::CommentFormat(const char* format, ...) {
+  static const uint32_t kMaxCommentSize = 1024;
+  char* p = reinterpret_cast<char*>(arena_->Alloc(kMaxCommentSize));
+  va_list args;
+  va_start(args, format);
+  size_t chars_written = vsnprintf(p, kMaxCommentSize - 1, format, args);
+  va_end(args);
+  size_t rewind = kMaxCommentSize - chars_written;
+  arena_->Rewind(rewind);
   Instr* i = AppendInstr(OPCODE_COMMENT_info, 0);
   i->src1.offset = (uint64_t)p;
   i->src2.value = i->src3.value = NULL;
@@ -639,32 +774,10 @@ void HIRBuilder::Nop() {
   i->src1.value = i->src2.value = i->src3.value = NULL;
 }
 
-void HIRBuilder::SourceOffset(uint64_t offset) {
+void HIRBuilder::SourceOffset(uint32_t offset) {
   Instr* i = AppendInstr(OPCODE_SOURCE_OFFSET_info, 0);
   i->src1.offset = offset;
   i->src2.value = i->src3.value = NULL;
-}
-
-void HIRBuilder::TraceSource(uint64_t offset) {
-  Instr* i = AppendInstr(OPCODE_TRACE_SOURCE_info, 100 | (100 << 8));
-  i->src1.offset = offset;
-  i->set_src2(LoadZero(INT64_TYPE));
-  i->set_src3(LoadZero(INT64_TYPE));
-}
-
-void HIRBuilder::TraceSource(uint64_t offset, uint8_t index, Value* value) {
-  Instr* i = AppendInstr(OPCODE_TRACE_SOURCE_info, index | (100 << 8));
-  i->src1.offset = offset;
-  i->set_src2(value);
-  i->set_src3(LoadZero(INT64_TYPE));
-}
-
-void HIRBuilder::TraceSource(uint64_t offset, uint8_t index_0, Value* value_0,
-                             uint8_t index_1, Value* value_1) {
-  Instr* i = AppendInstr(OPCODE_TRACE_SOURCE_info, index_0 | (index_1 << 8));
-  i->src1.offset = offset;
-  i->set_src2(value_0);
-  i->set_src3(value_1);
 }
 
 void HIRBuilder::DebugBreak() {
@@ -707,7 +820,7 @@ void HIRBuilder::TrapTrue(Value* cond, uint16_t trap_code) {
   EndBlock();
 }
 
-void HIRBuilder::Call(FunctionInfo* symbol_info, uint32_t call_flags) {
+void HIRBuilder::Call(FunctionInfo* symbol_info, uint16_t call_flags) {
   Instr* i = AppendInstr(OPCODE_CALL_info, call_flags);
   i->src1.symbol_info = symbol_info;
   i->src2.value = i->src3.value = NULL;
@@ -715,7 +828,7 @@ void HIRBuilder::Call(FunctionInfo* symbol_info, uint32_t call_flags) {
 }
 
 void HIRBuilder::CallTrue(Value* cond, FunctionInfo* symbol_info,
-                          uint32_t call_flags) {
+                          uint16_t call_flags) {
   if (cond->IsConstant()) {
     if (cond->IsConstantTrue()) {
       Call(symbol_info, call_flags);
@@ -730,8 +843,8 @@ void HIRBuilder::CallTrue(Value* cond, FunctionInfo* symbol_info,
   EndBlock();
 }
 
-void HIRBuilder::CallIndirect(Value* value, uint32_t call_flags) {
-  ASSERT_ADDRESS_TYPE(value);
+void HIRBuilder::CallIndirect(Value* value, uint16_t call_flags) {
+  ASSERT_CALL_ADDRESS_TYPE(value);
   Instr* i = AppendInstr(OPCODE_CALL_INDIRECT_info, call_flags);
   i->set_src1(value);
   i->src2.value = i->src3.value = NULL;
@@ -739,7 +852,7 @@ void HIRBuilder::CallIndirect(Value* value, uint32_t call_flags) {
 }
 
 void HIRBuilder::CallIndirectTrue(Value* cond, Value* value,
-                                  uint32_t call_flags) {
+                                  uint16_t call_flags) {
   if (cond->IsConstant()) {
     if (cond->IsConstantTrue()) {
       CallIndirect(value, call_flags);
@@ -747,7 +860,7 @@ void HIRBuilder::CallIndirectTrue(Value* cond, Value* value,
     return;
   }
 
-  ASSERT_ADDRESS_TYPE(value);
+  ASSERT_CALL_ADDRESS_TYPE(value);
   Instr* i = AppendInstr(OPCODE_CALL_INDIRECT_TRUE_info, call_flags);
   i->set_src1(cond);
   i->set_src2(value);
@@ -776,7 +889,7 @@ void HIRBuilder::ReturnTrue(Value* cond) {
     return;
   }
 
-  ASSERT_ADDRESS_TYPE(value);
+  ASSERT_ADDRESS_TYPE(cond);
   Instr* i = AppendInstr(OPCODE_RETURN_TRUE_info, 0);
   i->set_src1(cond);
   i->src2.value = i->src3.value = NULL;
@@ -784,19 +897,20 @@ void HIRBuilder::ReturnTrue(Value* cond) {
 }
 
 void HIRBuilder::SetReturnAddress(Value* value) {
+  ASSERT_CALL_ADDRESS_TYPE(value);
   Instr* i = AppendInstr(OPCODE_SET_RETURN_ADDRESS_info, 0);
   i->set_src1(value);
   i->src2.value = i->src3.value = NULL;
 }
 
-void HIRBuilder::Branch(Label* label, uint32_t branch_flags) {
+void HIRBuilder::Branch(Label* label, uint16_t branch_flags) {
   Instr* i = AppendInstr(OPCODE_BRANCH_info, branch_flags);
   i->src1.label = label;
   i->src2.value = i->src3.value = NULL;
   EndBlock();
 }
 
-void HIRBuilder::Branch(Block* block, uint32_t branch_flags) {
+void HIRBuilder::Branch(Block* block, uint16_t branch_flags) {
   if (!block->label_head) {
     // Block needs a label.
     Label* label = NewLabel();
@@ -805,7 +919,7 @@ void HIRBuilder::Branch(Block* block, uint32_t branch_flags) {
   Branch(block->label_head, branch_flags);
 }
 
-void HIRBuilder::BranchTrue(Value* cond, Label* label, uint32_t branch_flags) {
+void HIRBuilder::BranchTrue(Value* cond, Label* label, uint16_t branch_flags) {
   if (cond->IsConstant()) {
     if (cond->IsConstantTrue()) {
       Branch(label, branch_flags);
@@ -820,7 +934,7 @@ void HIRBuilder::BranchTrue(Value* cond, Label* label, uint32_t branch_flags) {
   EndBlock();
 }
 
-void HIRBuilder::BranchFalse(Value* cond, Label* label, uint32_t branch_flags) {
+void HIRBuilder::BranchFalse(Value* cond, Label* label, uint16_t branch_flags) {
   if (cond->IsConstant()) {
     if (cond->IsConstantFalse()) {
       Branch(label, branch_flags);
@@ -894,8 +1008,9 @@ Value* HIRBuilder::SignExtend(Value* value, TypeName target_type) {
 }
 
 Value* HIRBuilder::Truncate(Value* value, TypeName target_type) {
-  ASSERT_INTEGER_TYPE(value->type);
-  ASSERT_INTEGER_TYPE(target_type);
+  ASSERT_INTEGER_TYPE(value);
+  assert_true(target_type == INT8_TYPE || target_type == INT16_TYPE ||
+              target_type == INT32_TYPE || target_type == INT64_TYPE);
 
   if (value->type == target_type) {
     return value;
@@ -929,7 +1044,7 @@ Value* HIRBuilder::Convert(Value* value, TypeName target_type,
 }
 
 Value* HIRBuilder::Round(Value* value, RoundMode round_mode) {
-  ASSERT_FLOAT_TYPE(value);
+  ASSERT_FLOAT_OR_VECTOR_TYPE(value);
 
   if (value->IsConstant()) {
     Value* dest = CloneValue(value);
@@ -971,67 +1086,67 @@ Value* HIRBuilder::LoadZero(TypeName type) {
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(int8_t value) {
+Value* HIRBuilder::LoadConstantInt8(int8_t value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(uint8_t value) {
+Value* HIRBuilder::LoadConstantUint8(uint8_t value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(int16_t value) {
+Value* HIRBuilder::LoadConstantInt16(int16_t value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(uint16_t value) {
+Value* HIRBuilder::LoadConstantUint16(uint16_t value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(int32_t value) {
+Value* HIRBuilder::LoadConstantInt32(int32_t value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(uint32_t value) {
+Value* HIRBuilder::LoadConstantUint32(uint32_t value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(int64_t value) {
+Value* HIRBuilder::LoadConstantInt64(int64_t value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(uint64_t value) {
+Value* HIRBuilder::LoadConstantUint64(uint64_t value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(float value) {
+Value* HIRBuilder::LoadConstantFloat32(float value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(double value) {
+Value* HIRBuilder::LoadConstantFloat64(double value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
 }
 
-Value* HIRBuilder::LoadConstant(const vec128_t& value) {
+Value* HIRBuilder::LoadConstantVec128(const vec128_t& value) {
   Value* dest = AllocValue();
   dest->set_constant(value);
   return dest;
@@ -1095,6 +1210,23 @@ void HIRBuilder::StoreContext(size_t offset, Value* value) {
   i->src3.value = NULL;
 }
 
+Value* HIRBuilder::LoadMmio(cpu::MMIORange* mmio_range, uint32_t address,
+                            TypeName type) {
+  Instr* i = AppendInstr(OPCODE_LOAD_MMIO_info, 0, AllocValue(type));
+  i->src1.offset = reinterpret_cast<uint64_t>(mmio_range);
+  i->src2.offset = address;
+  i->src3.value = NULL;
+  return i->dest;
+}
+
+void HIRBuilder::StoreMmio(cpu::MMIORange* mmio_range, uint32_t address,
+                           Value* value) {
+  Instr* i = AppendInstr(OPCODE_STORE_MMIO_info, 0);
+  i->src1.offset = reinterpret_cast<uint64_t>(mmio_range);
+  i->src2.offset = address;
+  i->set_src3(value);
+}
+
 Value* HIRBuilder::Load(Value* address, TypeName type, uint32_t load_flags) {
   ASSERT_ADDRESS_TYPE(address);
   Instr* i = AppendInstr(OPCODE_LOAD_info, load_flags, AllocValue(type));
@@ -1109,6 +1241,16 @@ void HIRBuilder::Store(Value* address, Value* value, uint32_t store_flags) {
   i->set_src1(address);
   i->set_src2(value);
   i->src3.value = NULL;
+}
+
+void HIRBuilder::Memset(Value* address, Value* value, Value* length) {
+  ASSERT_ADDRESS_TYPE(address);
+  ASSERT_TYPES_EQUAL(address, length);
+  assert_true(value->type == INT8_TYPE);
+  Instr* i = AppendInstr(OPCODE_MEMSET_info, 0);
+  i->set_src1(address);
+  i->set_src2(value);
+  i->set_src3(length);
 }
 
 void HIRBuilder::Prefetch(Value* address, size_t length,
@@ -1193,7 +1335,7 @@ Value* HIRBuilder::Select(Value* cond, Value* value1, Value* value2) {
 
 Value* HIRBuilder::IsTrue(Value* value) {
   if (value->IsConstant()) {
-    return LoadConstant(value->IsConstantTrue() ? 1 : 0);
+    return LoadConstantInt8(value->IsConstantTrue() ? 1 : 0);
   }
 
   Instr* i = AppendInstr(OPCODE_IS_TRUE_info, 0, AllocValue(INT8_TYPE));
@@ -1204,7 +1346,7 @@ Value* HIRBuilder::IsTrue(Value* value) {
 
 Value* HIRBuilder::IsFalse(Value* value) {
   if (value->IsConstant()) {
-    return LoadConstant(value->IsConstantFalse() ? 1 : 0);
+    return LoadConstantInt8(value->IsConstantFalse() ? 1 : 0);
   }
 
   Instr* i = AppendInstr(OPCODE_IS_FALSE_info, 0, AllocValue(INT8_TYPE));
@@ -1217,7 +1359,7 @@ Value* HIRBuilder::CompareXX(const OpcodeInfo& opcode, Value* value1,
                              Value* value2) {
   ASSERT_TYPES_EQUAL(value1, value2);
   if (value1->IsConstant() && value2->IsConstant()) {
-    return LoadConstant(value1->Compare(opcode.num, value2) ? 1 : 0);
+    return LoadConstantInt8(value1->Compare(opcode.num, value2) ? 1 : 0);
   }
 
   Instr* i = AppendInstr(opcode, 0, AllocValue(INT8_TYPE));
@@ -1265,20 +1407,6 @@ Value* HIRBuilder::CompareUGT(Value* value1, Value* value2) {
 
 Value* HIRBuilder::CompareUGE(Value* value1, Value* value2) {
   return CompareXX(OPCODE_COMPARE_UGE_info, value1, value2);
-}
-
-Value* HIRBuilder::DidCarry(Value* value) {
-  Instr* i = AppendInstr(OPCODE_DID_CARRY_info, 0, AllocValue(INT8_TYPE));
-  i->set_src1(value);
-  i->src2.value = i->src3.value = NULL;
-  return i->dest;
-}
-
-Value* HIRBuilder::DidOverflow(Value* value) {
-  Instr* i = AppendInstr(OPCODE_DID_OVERFLOW_info, 0, AllocValue(INT8_TYPE));
-  i->set_src1(value);
-  i->src2.value = i->src3.value = NULL;
-  return i->dest;
 }
 
 Value* HIRBuilder::DidSaturate(Value* value) {
@@ -1491,8 +1619,6 @@ Value* HIRBuilder::MulSub(Value* value1, Value* value2, Value* value3) {
 }
 
 Value* HIRBuilder::Neg(Value* value) {
-  ASSERT_NON_VECTOR_TYPE(value);
-
   Instr* i = AppendInstr(OPCODE_NEG_info, 0, AllocValue(value->type));
   i->set_src1(value);
   i->src2.value = i->src3.value = NULL;
@@ -1500,7 +1626,7 @@ Value* HIRBuilder::Neg(Value* value) {
 }
 
 Value* HIRBuilder::Abs(Value* value) {
-  ASSERT_NON_VECTOR_TYPE(value);
+  ASSERT_FLOAT_OR_VECTOR_TYPE(value);
 
   Instr* i = AppendInstr(OPCODE_ABS_info, 0, AllocValue(value->type));
   i->set_src1(value);
@@ -1509,7 +1635,7 @@ Value* HIRBuilder::Abs(Value* value) {
 }
 
 Value* HIRBuilder::Sqrt(Value* value) {
-  ASSERT_FLOAT_TYPE(value);
+  ASSERT_FLOAT_OR_VECTOR_TYPE(value);
 
   Instr* i = AppendInstr(OPCODE_SQRT_info, 0, AllocValue(value->type));
   i->set_src1(value);
@@ -1518,7 +1644,7 @@ Value* HIRBuilder::Sqrt(Value* value) {
 }
 
 Value* HIRBuilder::RSqrt(Value* value) {
-  ASSERT_FLOAT_TYPE(value);
+  ASSERT_FLOAT_OR_VECTOR_TYPE(value);
 
   Instr* i = AppendInstr(OPCODE_RSQRT_info, 0, AllocValue(value->type));
   i->set_src1(value);
@@ -1527,7 +1653,7 @@ Value* HIRBuilder::RSqrt(Value* value) {
 }
 
 Value* HIRBuilder::Pow2(Value* value) {
-  ASSERT_FLOAT_TYPE(value);
+  ASSERT_FLOAT_OR_VECTOR_TYPE(value);
 
   Instr* i = AppendInstr(OPCODE_POW2_info, 0, AllocValue(value->type));
   i->set_src1(value);
@@ -1536,7 +1662,7 @@ Value* HIRBuilder::Pow2(Value* value) {
 }
 
 Value* HIRBuilder::Log2(Value* value) {
-  ASSERT_FLOAT_TYPE(value);
+  ASSERT_FLOAT_OR_VECTOR_TYPE(value);
 
   Instr* i = AppendInstr(OPCODE_LOG2_info, 0, AllocValue(value->type));
   i->set_src1(value);
@@ -1571,8 +1697,8 @@ Value* HIRBuilder::DotProduct4(Value* value1, Value* value2) {
 }
 
 Value* HIRBuilder::And(Value* value1, Value* value2) {
-  ASSERT_INTEGER_TYPE(value1);
-  ASSERT_INTEGER_TYPE(value2);
+  ASSERT_NON_FLOAT_TYPE(value1);
+  ASSERT_NON_FLOAT_TYPE(value2);
   ASSERT_TYPES_EQUAL(value1, value2);
 
   if (value1 == value2) {
@@ -1591,8 +1717,8 @@ Value* HIRBuilder::And(Value* value1, Value* value2) {
 }
 
 Value* HIRBuilder::Or(Value* value1, Value* value2) {
-  ASSERT_INTEGER_TYPE(value1);
-  ASSERT_INTEGER_TYPE(value2);
+  ASSERT_NON_FLOAT_TYPE(value1);
+  ASSERT_NON_FLOAT_TYPE(value2);
   ASSERT_TYPES_EQUAL(value1, value2);
 
   if (value1 == value2) {
@@ -1611,8 +1737,8 @@ Value* HIRBuilder::Or(Value* value1, Value* value2) {
 }
 
 Value* HIRBuilder::Xor(Value* value1, Value* value2) {
-  ASSERT_INTEGER_TYPE(value1);
-  ASSERT_INTEGER_TYPE(value2);
+  ASSERT_NON_FLOAT_TYPE(value1);
+  ASSERT_NON_FLOAT_TYPE(value2);
   ASSERT_TYPES_EQUAL(value1, value2);
 
   if (value1 == value2) {
@@ -1627,7 +1753,7 @@ Value* HIRBuilder::Xor(Value* value1, Value* value2) {
 }
 
 Value* HIRBuilder::Not(Value* value) {
-  ASSERT_INTEGER_TYPE(value);
+  ASSERT_NON_FLOAT_TYPE(value);
 
   if (value->IsConstant()) {
     Value* dest = CloneValue(value);
@@ -1642,7 +1768,7 @@ Value* HIRBuilder::Not(Value* value) {
 }
 
 Value* HIRBuilder::Shl(Value* value1, Value* value2) {
-  ASSERT_INTEGER_TYPE(value1);
+  ASSERT_NON_FLOAT_TYPE(value1);
   ASSERT_INTEGER_TYPE(value2);
 
   // NOTE AND value2 with 0x3F for 64bit, 0x1F for 32bit, etc..
@@ -1661,7 +1787,7 @@ Value* HIRBuilder::Shl(Value* value1, Value* value2) {
   return i->dest;
 }
 Value* HIRBuilder::Shl(Value* value1, int8_t value2) {
-  return Shl(value1, LoadConstant(value2));
+  return Shl(value1, LoadConstantInt8(value2));
 }
 
 Value* HIRBuilder::VectorShl(Value* value1, Value* value2, TypeName part_type) {
@@ -1677,7 +1803,7 @@ Value* HIRBuilder::VectorShl(Value* value1, Value* value2, TypeName part_type) {
 }
 
 Value* HIRBuilder::Shr(Value* value1, Value* value2) {
-  ASSERT_INTEGER_TYPE(value1);
+  ASSERT_NON_FLOAT_TYPE(value1);
   ASSERT_INTEGER_TYPE(value2);
 
   if (value2->IsConstantZero()) {
@@ -1694,7 +1820,7 @@ Value* HIRBuilder::Shr(Value* value1, Value* value2) {
   return i->dest;
 }
 Value* HIRBuilder::Shr(Value* value1, int8_t value2) {
-  return Shr(value1, LoadConstant(value2));
+  return Shr(value1, LoadConstantInt8(value2));
 }
 
 Value* HIRBuilder::VectorShr(Value* value1, Value* value2, TypeName part_type) {
@@ -1727,7 +1853,7 @@ Value* HIRBuilder::Sha(Value* value1, Value* value2) {
   return i->dest;
 }
 Value* HIRBuilder::Sha(Value* value1, int8_t value2) {
-  return Sha(value1, LoadConstant(value2));
+  return Sha(value1, LoadConstantInt8(value2));
 }
 
 Value* HIRBuilder::VectorSha(Value* value1, Value* value2, TypeName part_type) {
@@ -1810,7 +1936,8 @@ Value* HIRBuilder::CountLeadingZeros(Value* value) {
     const static uint8_t zeros[] = {
         8, 16, 32, 64,
     };
-    return LoadConstant(zeros[value->type]);
+    assert_true(value->type <= INT64_TYPE);
+    return LoadConstantUint8(zeros[value->type]);
   }
 
   Instr* i = AppendInstr(OPCODE_CNTLZ_info, 0, AllocValue(INT8_TYPE));
@@ -1833,7 +1960,7 @@ Value* HIRBuilder::Insert(Value* value, Value* index, Value* part) {
 }
 
 Value* HIRBuilder::Insert(Value* value, uint64_t index, Value* part) {
-  return Insert(value, LoadConstant(index), part);
+  return Insert(value, LoadConstantUint64(index), part);
 }
 
 Value* HIRBuilder::Extract(Value* value, Value* index, TypeName target_type) {
@@ -1850,7 +1977,7 @@ Value* HIRBuilder::Extract(Value* value, Value* index, TypeName target_type) {
 }
 
 Value* HIRBuilder::Extract(Value* value, uint8_t index, TypeName target_type) {
-  return Extract(value, LoadConstant(index), target_type);
+  return Extract(value, LoadConstantUint8(index), target_type);
 }
 
 Value* HIRBuilder::Splat(Value* value, TypeName target_type) {
@@ -1897,7 +2024,7 @@ Value* HIRBuilder::Swizzle(Value* value, TypeName part_type,
 }
 
 Value* HIRBuilder::Pack(Value* value, uint32_t pack_flags) {
-  return Pack(value, LoadZero(VEC128_TYPE), pack_flags);
+  return Pack(value, LoadZeroVec128(), pack_flags);
 }
 
 Value* HIRBuilder::Pack(Value* value1, Value* value2, uint32_t pack_flags) {
@@ -1929,20 +2056,6 @@ Value* HIRBuilder::Unpack(Value* value, uint32_t pack_flags) {
   return i->dest;
 }
 
-Value* HIRBuilder::CompareExchange(Value* address, Value* compare_value,
-                                   Value* exchange_value) {
-  ASSERT_ADDRESS_TYPE(address);
-  ASSERT_INTEGER_TYPE(compare_value);
-  ASSERT_INTEGER_TYPE(exchange_value);
-  ASSERT_TYPES_EQUAL(compare_value, exchange_value);
-  Instr* i = AppendInstr(OPCODE_COMPARE_EXCHANGE_info, 0,
-                         AllocValue(exchange_value->type));
-  i->set_src1(address);
-  i->set_src2(compare_value);
-  i->set_src3(exchange_value);
-  return i->dest;
-}
-
 Value* HIRBuilder::AtomicExchange(Value* address, Value* new_value) {
   ASSERT_ADDRESS_TYPE(address);
   ASSERT_INTEGER_TYPE(new_value);
@@ -1950,26 +2063,6 @@ Value* HIRBuilder::AtomicExchange(Value* address, Value* new_value) {
       AppendInstr(OPCODE_ATOMIC_EXCHANGE_info, 0, AllocValue(new_value->type));
   i->set_src1(address);
   i->set_src2(new_value);
-  i->src3.value = NULL;
-  return i->dest;
-}
-
-Value* HIRBuilder::AtomicAdd(Value* address, Value* value) {
-  ASSERT_ADDRESS_TYPE(address);
-  ASSERT_INTEGER_TYPE(value);
-  Instr* i = AppendInstr(OPCODE_ATOMIC_ADD_info, 0, AllocValue(value->type));
-  i->set_src1(address);
-  i->set_src2(value);
-  i->src3.value = NULL;
-  return i->dest;
-}
-
-Value* HIRBuilder::AtomicSub(Value* address, Value* value) {
-  ASSERT_ADDRESS_TYPE(address);
-  ASSERT_INTEGER_TYPE(value);
-  Instr* i = AppendInstr(OPCODE_ATOMIC_SUB_info, 0, AllocValue(value->type));
-  i->set_src1(address);
-  i->set_src2(value);
   i->src3.value = NULL;
   return i->dest;
 }

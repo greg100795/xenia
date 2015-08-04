@@ -7,7 +7,7 @@
  ******************************************************************************
  */
 
-#include "xenia/common.h"
+#include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/objects/xthread.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -17,8 +17,8 @@
 namespace xe {
 namespace kernel {
 
-SHIM_CALL KeEnableFpuExceptions_shim(PPCContext* ppc_state,
-                                     KernelState* state) {
+SHIM_CALL KeEnableFpuExceptions_shim(PPCContext* ppc_context,
+                                     KernelState* kernel_state) {
   uint32_t enabled = SHIM_GET_ARG_32(0);
   XELOGD("KeEnableFpuExceptions(%d)", enabled);
   // TODO(benvanik): can we do anything about exceptions?
@@ -27,7 +27,7 @@ SHIM_CALL KeEnableFpuExceptions_shim(PPCContext* ppc_state,
 }  // namespace kernel
 }  // namespace xe
 
-void xe::kernel::xboxkrnl::RegisterMiscExports(ExportResolver* export_resolver,
-                                               KernelState* state) {
+void xe::kernel::xboxkrnl::RegisterMiscExports(
+    xe::cpu::ExportResolver* export_resolver, KernelState* kernel_state) {
   SHIM_SET_MAPPING("xboxkrnl.exe", KeEnableFpuExceptions, state);
 }

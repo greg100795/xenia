@@ -7,44 +7,52 @@
  ******************************************************************************
  */
 
-#include "xenia/common.h"
+#include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/objects/xenumerator.h"
 #include "xenia/kernel/objects/xuser_module.h"
+#include "xenia/kernel/objects/xthread.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/util/xex2.h"
+#include "xenia/kernel/xam_module.h"
 #include "xenia/kernel/xam_private.h"
 #include "xenia/xbox.h"
 
 namespace xe {
 namespace kernel {
 
-SHIM_CALL XamGetSystemVersion_shim(PPCContext* ppc_state, KernelState* state) {
+constexpr uint32_t X_LANGUAGE_ENGLISH = 1;
+constexpr uint32_t X_LANGUAGE_JAPANESE = 2;
+
+SHIM_CALL XamGetSystemVersion_shim(PPCContext* ppc_context,
+                                   KernelState* kernel_state) {
   XELOGD("XamGetSystemVersion()");
   // eh, just picking one. If we go too low we may break new games, but
   // this value seems to be used for conditionally loading symbols and if
   // we pretend to be old we have less to worry with implementing.
   // 0x200A3200
   // 0x20096B00
-  SHIM_SET_RETURN_64(0);
+  SHIM_SET_RETURN_32(0);
 }
 
-SHIM_CALL XGetAVPack_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL XGetAVPack_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   // DWORD
   // Not sure what the values are for this, but 6 is VGA.
   // Other likely values are 3/4/8 for HDMI or something.
   // Games seem to use this as a PAL check - if the result is not 3/4/6/8
   // they explode with errors if not in PAL mode.
-  SHIM_SET_RETURN_64(6);
+  SHIM_SET_RETURN_32(6);
 }
 
-SHIM_CALL XGetGameRegion_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL XGetGameRegion_shim(PPCContext* ppc_context,
+                              KernelState* kernel_state) {
   XELOGD("XGetGameRegion()");
 
-  SHIM_SET_RETURN_64(XEX_REGION_ALL);
+  SHIM_SET_RETURN_32(0xFFFF);
 }
 
-SHIM_CALL XGetLanguage_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL XGetLanguage_shim(PPCContext* ppc_context,
+                            KernelState* kernel_state) {
   XELOGD("XGetLanguage()");
 
   uint32_t desired_language = X_LANGUAGE_ENGLISH;
@@ -59,64 +67,111 @@ SHIM_CALL XGetLanguage_shim(PPCContext* ppc_state, KernelState* state) {
   }
   // Add more overrides?
 
-  SHIM_SET_RETURN_64(desired_language);
+  SHIM_SET_RETURN_32(desired_language);
 }
 
-SHIM_CALL XamVoiceIsActiveProcess_shim(PPCContext* ppc_state,
-                                       KernelState* state) {
-  XELOGD("XamVoiceIsActiveProcess()");
-  // Returning 0 here will short-circuit a bunch of voice stuff.
-  SHIM_SET_RETURN_32(0);
-}
-
-SHIM_CALL XamGetExecutionId_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL XamGetExecutionId_shim(PPCContext* ppc_context,
+                                 KernelState* kernel_state) {
   uint32_t info_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("XamGetExecutionId(%.8X)", info_ptr);
 
-  auto module = state->GetExecutableModule();
+  auto module = kernel_state->GetExecutableModule();
   assert_not_null(module);
 
-  SHIM_SET_MEM_32(info_ptr, module->execution_info_ptr());
+  uint32_t guest_hdr_ptr;
+  X_STATUS result =
+      module->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &guest_hdr_ptr);
 
-  module->Release();
+  if (XFAILED(result)) {
+    SHIM_SET_RETURN_32(result);
+    return;
+  }
 
-  SHIM_SET_RETURN_32(0);
+  SHIM_SET_MEM_32(info_ptr, guest_hdr_ptr);
+  SHIM_SET_RETURN_32(X_STATUS_SUCCESS);
 }
 
-SHIM_CALL XamLoaderGetLaunchDataSize_shim(PPCContext* ppc_state,
-                                          KernelState* state) {
-  uint32_t size_ptr = SHIM_GET_ARG_32(0);
+dword_result_t XamLoaderSetLaunchData(lpvoid_t data, dword_t size) {
+  auto xam = kernel_state()->GetKernelModule<kernel::XamModule>("xam.xex");
 
-  XELOGD("XamLoaderGetLaunchDataSize(%.8X)", size_ptr);
+  auto& loader_data = xam->loader_data();
+  if (loader_data.launch_data_ptr) {
+    kernel_memory()->SystemHeapFree(loader_data.launch_data_ptr);
+  }
 
-  SHIM_SET_MEM_32(size_ptr, 0);
+  loader_data.launch_data_ptr = kernel_memory()->SystemHeapAlloc(size);
+  loader_data.launch_data_size = size;
 
-  SHIM_SET_RETURN_64(0);
+  std::memcpy(kernel_memory()->TranslateVirtual(loader_data.launch_data_ptr),
+              data, size);
+
+  // FIXME: Unknown return value.
+  return 0;
 }
+DECLARE_XAM_EXPORT(XamLoaderSetLaunchData, ExportTag::kSketchy);
 
-SHIM_CALL XamLoaderGetLaunchData_shim(PPCContext* ppc_state,
-                                      KernelState* state) {
-  uint32_t buffer_ptr = SHIM_GET_ARG_32(0);
-  uint32_t buffer_size = SHIM_GET_ARG_32(1);
+dword_result_t XamLoaderGetLaunchDataSize(lpdword_t size_ptr) {
+  auto xam = kernel_state()->GetKernelModule<kernel::XamModule>("xam.xex");
 
-  XELOGD("XamLoaderGetLaunchData(%.8X, %d)", buffer_ptr, buffer_size);
+  *size_ptr = xam->loader_data().launch_data_size;
 
-  SHIM_SET_RETURN_64(0);
+  return 0;
 }
+DECLARE_XAM_EXPORT(XamLoaderGetLaunchDataSize, ExportTag::kSketchy);
 
-SHIM_CALL XamLoaderLaunchTitle_shim(PPCContext* ppc_state, KernelState* state) {
-  XELOGD("XamLoaderLaunchTitle(?)");
-  assert_always();
+dword_result_t XamLoaderGetLaunchData(lpvoid_t buffer_ptr,
+                                      dword_t buffer_size) {
+  auto xam = kernel_state()->GetKernelModule<kernel::XamModule>("xam.xex");
+
+  auto& loader_data = xam->loader_data();
+  if (loader_data.launch_data_ptr) {
+    uint8_t* loader_buffer_ptr =
+        kernel_memory()->TranslateVirtual(loader_data.launch_data_ptr);
+
+    uint32_t copy_size =
+        std::min(loader_data.launch_data_size, (uint32_t)buffer_size);
+
+    std::memcpy(buffer_ptr, loader_buffer_ptr, copy_size);
+  }
+
+  return 0;
 }
+DECLARE_XAM_EXPORT(XamLoaderGetLaunchData, ExportTag::kSketchy);
 
-SHIM_CALL XamLoaderTerminateTitle_shim(PPCContext* ppc_state,
-                                       KernelState* state) {
-  XELOGD("XamLoaderTerminateTitle()");
-  assert_always();
+void XamLoaderLaunchTitle(lpstring_t raw_name, dword_t flags) {
+  auto xam = kernel_state()->GetKernelModule<kernel::XamModule>("xam.xex");
+
+  auto& loader_data = xam->loader_data();
+  loader_data.launch_flags = flags;
+
+  // Translate the launch path to a full path.
+  if (raw_name) {
+    std::string name = xe::find_name_from_path(std::string(raw_name));
+    std::string path(raw_name);
+    if (name == std::string(raw_name)) {
+      path = xe::join_paths(
+          xe::find_base_path(kernel_state()->GetExecutableModule()->path()),
+          name);
+    }
+
+    loader_data.launch_path = path;
+  } else {
+    assert_always("Game requested exit to dashboard via XamLoaderLaunchTitle");
+  }
+
+  // This function does not return.
+  kernel_state()->TerminateTitle(true);
 }
+DECLARE_XAM_EXPORT(XamLoaderLaunchTitle, ExportTag::kSketchy);
 
-SHIM_CALL XamAlloc_shim(PPCContext* ppc_state, KernelState* state) {
+void XamLoaderTerminateTitle() {
+  // This function does not return.
+  kernel_state()->TerminateTitle(true);
+}
+DECLARE_XAM_EXPORT(XamLoaderTerminateTitle, ExportTag::kSketchy);
+
+SHIM_CALL XamAlloc_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   uint32_t unk = SHIM_GET_ARG_32(0);
   uint32_t size = SHIM_GET_ARG_32(1);
   uint32_t out_ptr = SHIM_GET_ARG_32(2);
@@ -127,82 +182,76 @@ SHIM_CALL XamAlloc_shim(PPCContext* ppc_state, KernelState* state) {
 
   // Allocate from the heap. Not sure why XAM does this specially, perhaps
   // it keeps stuff in a separate heap?
-  uint32_t ptr = state->memory()->SystemHeapAlloc(size);
+  uint32_t ptr = kernel_state->memory()->SystemHeapAlloc(size);
   SHIM_SET_MEM_32(out_ptr, ptr);
 
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
 }
 
-SHIM_CALL XamFree_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL XamFree_shim(PPCContext* ppc_context, KernelState* kernel_state) {
   uint32_t ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("XamFree(%.8X)", ptr);
 
-  state->memory()->SystemHeapFree(ptr);
+  kernel_state->memory()->SystemHeapFree(ptr);
 
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
 }
 
-SHIM_CALL XamEnumerate_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t handle = SHIM_GET_ARG_32(0);
-  uint32_t zero = SHIM_GET_ARG_32(1);
-  uint32_t buffer_ptr = SHIM_GET_ARG_32(2);
-  uint32_t buffer_length = SHIM_GET_ARG_32(3);
-  uint32_t item_count_ptr = SHIM_GET_ARG_32(4);
-  uint32_t overlapped_ptr = SHIM_GET_ARG_32(5);
+// https://github.com/LestaD/SourceEngine2007/blob/master/se2007/engine/xboxsystem.cpp#L518
+dword_result_t XamEnumerate(dword_t handle, dword_t flags, lpvoid_t buffer,
+                            dword_t buffer_length, lpdword_t items_returned,
+                            pointer_t<XAM_OVERLAPPED> overlapped) {
+  assert_true(flags == 0);
 
-  assert_true(zero == 0);
-
-  XELOGD("XamEnumerate(%.8X, %d, %.8X, %d, %.8X, %.8X)", handle, zero,
-         buffer_ptr, buffer_length, item_count_ptr, overlapped_ptr);
-
-  XEnumerator* e = nullptr;
-  if (XFAILED(state->object_table()->GetObject(handle, (XObject**)&e))) {
-    SHIM_SET_RETURN_64(X_ERROR_INVALID_HANDLE);
-    return;
+  auto e = kernel_state()->object_table()->LookupObject<XEnumerator>(handle);
+  if (!e) {
+    if (overlapped) {
+      kernel_state()->CompleteOverlappedImmediateEx(
+          overlapped, X_ERROR_INVALID_HANDLE, X_ERROR_INVALID_HANDLE, 0);
+      return X_ERROR_IO_PENDING;
+    } else {
+      return X_ERROR_INVALID_HANDLE;
+    }
   }
 
-  auto item_count = e->item_count();
-  e->WriteItems(SHIM_MEM_ADDR(buffer_ptr));
+  buffer.Zero(buffer_length);
+  X_RESULT result =
+      e->WriteItem(buffer) ? X_ERROR_SUCCESS : X_ERROR_NO_MORE_FILES;
 
-  X_RESULT result = item_count ? X_ERROR_SUCCESS : X_ERROR_NO_MORE_FILES;
-  if (item_count_ptr) {
-    assert_zero(overlapped_ptr);
-    SHIM_SET_MEM_32(item_count_ptr, item_count);
-  } else if (overlapped_ptr) {
-    assert_zero(item_count_ptr);
-    state->CompleteOverlappedImmediate(overlapped_ptr, result, item_count);
-    result = X_ERROR_IO_PENDING;
+  // Return X_ERROR_NO_MORE_FILES in HRESULT form.
+  X_HRESULT extended_result = result != 0 ? 0x80070012 : 0;
+  if (items_returned) {
+    assert_true(!overlapped);
+    *items_returned = result == X_ERROR_SUCCESS ? 1 : 0;
+
+    return result;
+  } else if (overlapped) {
+    assert_true(!items_returned);
+    kernel_state()->CompleteOverlappedImmediateEx(
+        overlapped, result, extended_result,
+        result == X_ERROR_SUCCESS ? e->item_count() : 0);
+
+    return X_ERROR_IO_PENDING;
   } else {
     assert_always();
-    result = X_ERROR_INVALID_PARAMETER;
+    return X_ERROR_INVALID_PARAMETER;
   }
-
-  e->Release();
-
-  SHIM_SET_RETURN_64(result);
 }
+DECLARE_XAM_EXPORT(XamEnumerate, ExportTag::kImplemented);
 
 }  // namespace kernel
 }  // namespace xe
 
-void xe::kernel::xam::RegisterInfoExports(ExportResolver* export_resolver,
-                                          KernelState* state) {
+void xe::kernel::xam::RegisterInfoExports(
+    xe::cpu::ExportResolver* export_resolver, KernelState* kernel_state) {
   SHIM_SET_MAPPING("xam.xex", XamGetSystemVersion, state);
   SHIM_SET_MAPPING("xam.xex", XGetAVPack, state);
   SHIM_SET_MAPPING("xam.xex", XGetGameRegion, state);
   SHIM_SET_MAPPING("xam.xex", XGetLanguage, state);
 
-  SHIM_SET_MAPPING("xam.xex", XamVoiceIsActiveProcess, state);
-
   SHIM_SET_MAPPING("xam.xex", XamGetExecutionId, state);
-  SHIM_SET_MAPPING("xam.xex", XamLoaderGetLaunchDataSize, state);
-  SHIM_SET_MAPPING("xam.xex", XamLoaderGetLaunchData, state);
-  SHIM_SET_MAPPING("xam.xex", XamLoaderLaunchTitle, state);
-  SHIM_SET_MAPPING("xam.xex", XamLoaderTerminateTitle, state);
 
   SHIM_SET_MAPPING("xam.xex", XamAlloc, state);
   SHIM_SET_MAPPING("xam.xex", XamFree, state);
-
-  SHIM_SET_MAPPING("xam.xex", XamEnumerate, state);
 }

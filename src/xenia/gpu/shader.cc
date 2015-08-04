@@ -9,7 +9,10 @@
 
 #include "xenia/gpu/shader.h"
 
-#include "poly/math.h"
+#include <cstring>
+
+#include "xenia/base/math.h"
+#include "xenia/base/memory.h"
 #include "xenia/gpu/ucode_disassembler.h"
 
 namespace xe {
@@ -25,7 +28,7 @@ Shader::Shader(ShaderType shader_type, uint64_t data_hash,
       has_prepared_(false),
       is_valid_(false) {
   data_.resize(dword_count);
-  poly::copy_and_swap(data_.data(), dword_ptr, dword_count);
+  xe::copy_and_swap(data_.data(), dword_ptr, dword_count);
   std::memset(&alloc_counts_, 0, sizeof(alloc_counts_));
   std::memset(&buffer_inputs_, 0, sizeof(buffer_inputs_));
   std::memset(&sampler_inputs_, 0, sizeof(sampler_inputs_));
@@ -92,7 +95,7 @@ void Shader::GatherExec(const instr_cf_exec_t* cf) {
   uint32_t sequence = cf->serialize;
   for (uint32_t i = 0; i < cf->count; i++) {
     uint32_t alu_off = (cf->address + i);
-    int sync = sequence & 0x2;
+    // int sync = sequence & 0x2;
     if (sequence & 0x1) {
       auto fetch =
           reinterpret_cast<const instr_fetch_t*>(data_.data() + alu_off * 3);
@@ -197,7 +200,7 @@ void Shader::GatherVertexFetch(const instr_fetch_vtx_t* vtx) {
   for (size_t n = 0; n < inputs.count; n++) {
     auto& desc = inputs.descs[n];
     if (desc.fetch_slot == fetch_slot) {
-      assert_true(desc.element_count <= poly::countof(desc.elements));
+      assert_true(desc.element_count <= xe::countof(desc.elements));
       // It may not hold that all strides are equal, but I hope it does.
       assert_true(!vtx->stride || desc.stride_words == vtx->stride);
       el = &desc.elements[desc.element_count++];
@@ -206,7 +209,7 @@ void Shader::GatherVertexFetch(const instr_fetch_vtx_t* vtx) {
   }
   if (!el) {
     assert_not_zero(vtx->stride);
-    assert_true(inputs.count + 1 < poly::countof(inputs.descs));
+    assert_true(inputs.count + 1 < xe::countof(inputs.descs));
     auto& desc = inputs.descs[inputs.count++];
     desc.input_index = inputs.count - 1;
     desc.fetch_slot = fetch_slot;
@@ -262,7 +265,7 @@ void Shader::GatherTextureFetch(const instr_fetch_tex_t* tex) {
 
   assert_true(tex->const_idx < 0x1F);
 
-  assert_true(sampler_inputs_.count + 1 <= poly::countof(sampler_inputs_.descs));
+  assert_true(sampler_inputs_.count + 1 <= xe::countof(sampler_inputs_.descs));
   auto& input = sampler_inputs_.descs[sampler_inputs_.count++];
   input.input_index = sampler_inputs_.count - 1;
   input.fetch_slot = tex->const_idx & 0xF;  // ??????????????????????????????

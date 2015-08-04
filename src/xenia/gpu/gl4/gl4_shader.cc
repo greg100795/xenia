@@ -9,22 +9,18 @@
 
 #include "xenia/gpu/gl4/gl4_shader.h"
 
-#include "poly/cxx_compat.h"
-#include "poly/math.h"
-#include "xenia/gpu/gl4/gl4_gpu-private.h"
+#include "xenia/base/filesystem.h"
+#include "xenia/base/logging.h"
+#include "xenia/base/math.h"
+#include "xenia/gpu/gl4/gl4_gpu_flags.h"
 #include "xenia/gpu/gl4/gl4_shader_translator.h"
-#include "xenia/gpu/gpu-private.h"
+#include "xenia/gpu/gpu_flags.h"
 
 namespace xe {
 namespace gpu {
 namespace gl4 {
 
 using namespace xe::gpu::xenos;
-
-extern "C" GLEWContext* glewGetContext();
-
-// Stateful, but minimally.
-thread_local GL4ShaderTranslator shader_translator_;
 
 GL4Shader::GL4Shader(ShaderType shader_type, uint64_t data_hash,
                      const uint32_t* dword_ptr, uint32_t dword_count)
@@ -130,15 +126,6 @@ std::string GL4Shader::GetFooter() {
 bool GL4Shader::PrepareVertexArrayObject() {
   glCreateVertexArrays(1, &vao_);
 
-  bool has_bindless_vbos = false;
-  if (FLAGS_vendor_gl_extensions && GLEW_NV_vertex_buffer_unified_memory) {
-    has_bindless_vbos = true;
-    // Nasty, but no DSA for this.
-    glBindVertexArray(vao_);
-    glEnableClientState(GL_VERTEX_ATTRIB_ARRAY_UNIFIED_NV);
-    glEnableClientState(GL_ELEMENT_ARRAY_UNIFIED_NV);
-  }
-
   uint32_t el_index = 0;
   for (uint32_t buffer_index = 0; buffer_index < buffer_inputs_.count;
        ++buffer_index) {
@@ -202,28 +189,17 @@ bool GL4Shader::PrepareVertexArrayObject() {
       }
 
       glEnableVertexArrayAttrib(vao_, el_index);
-      if (has_bindless_vbos) {
-        // NOTE: MultiDrawIndirectBindlessMumble doesn't handle separate
-        // vertex bindings/formats.
-        glVertexAttribFormat(el_index, comp_count, comp_type, el.is_normalized,
-                             el.offset_words * 4);
-        glVertexArrayVertexBuffer(vao_, el_index, 0, 0, desc.stride_words * 4);
-      } else {
-        glVertexArrayAttribBinding(vao_, el_index, buffer_index);
-        glVertexArrayAttribFormat(vao_, el_index, comp_count, comp_type,
-                                  el.is_normalized, el.offset_words * 4);
-      }
+      glVertexArrayAttribBinding(vao_, el_index, buffer_index);
+      glVertexArrayAttribFormat(vao_, el_index, comp_count, comp_type,
+                                el.is_normalized, el.offset_words * 4);
     }
-  }
-
-  if (has_bindless_vbos) {
-    glBindVertexArray(0);
   }
 
   return true;
 }
 
 bool GL4Shader::PrepareVertexShader(
+    GL4ShaderTranslator* shader_translator,
     const xenos::xe_gpu_program_cntl_t& program_cntl) {
   if (has_prepared_) {
     return is_valid_;
@@ -232,7 +208,7 @@ bool GL4Shader::PrepareVertexShader(
 
   // Build static vertex array descriptor.
   if (!PrepareVertexArrayObject()) {
-    PLOGE("Unable to prepare vertex shader array object");
+    XELOGE("Unable to prepare vertex shader array object");
     return false;
   }
   std::string apply_transform =
@@ -277,9 +253,9 @@ bool GL4Shader::PrepareVertexShader(
       GetFooter();
 
   std::string translated_source =
-      shader_translator_.TranslateVertexShader(this, program_cntl);
+      shader_translator->TranslateVertexShader(this, program_cntl);
   if (translated_source.empty()) {
-    PLOGE("Vertex shader failed translation");
+    XELOGE("Vertex shader failed translation");
     return false;
   }
   source += translated_source;
@@ -293,6 +269,7 @@ bool GL4Shader::PrepareVertexShader(
 }
 
 bool GL4Shader::PreparePixelShader(
+    GL4ShaderTranslator* shader_translator,
     const xenos::xe_gpu_program_cntl_t& program_cntl) {
   if (has_prepared_) {
     return is_valid_;
@@ -330,9 +307,9 @@ bool GL4Shader::PreparePixelShader(
       GetFooter();
 
   std::string translated_source =
-      shader_translator_.TranslatePixelShader(this, program_cntl);
+      shader_translator->TranslatePixelShader(this, program_cntl);
   if (translated_source.empty()) {
-    PLOGE("Pixel shader failed translation");
+    XELOGE("Pixel shader failed translation");
     return false;
   }
 
@@ -354,19 +331,27 @@ bool GL4Shader::CompileProgram(std::string source) {
 
   // Save to disk, if we asked for it.
   auto base_path = FLAGS_dump_shaders.c_str();
-  char file_name[poly::max_path];
-  snprintf(file_name, poly::countof(file_name), "%s/gl4_gen_%.16llX.%s",
+  char file_name[xe::max_path];
+  snprintf(file_name, xe::countof(file_name), "%s/gl4_gen_%.16llX.%s",
            base_path, data_hash_,
            shader_type_ == ShaderType::kVertex ? "vert" : "frag");
-  if (FLAGS_dump_shaders.size()) {
+  if (!FLAGS_dump_shaders.empty()) {
+    // Ensure shader dump path exists.
+    auto dump_shaders_path = xe::to_wstring(FLAGS_dump_shaders);
+    if (!dump_shaders_path.empty()) {
+      dump_shaders_path = xe::to_absolute_path(dump_shaders_path);
+      xe::filesystem::CreateFolder(dump_shaders_path);
+    }
+
     // Note that we put the translated source first so we get good line numbers.
     FILE* f = fopen(file_name, "w");
-    fprintf(f, translated_disassembly_.c_str());
-    fprintf(f, "\n\n");
-    fprintf(f, "/*\n");
-    fprintf(f, ucode_disassembly_.c_str());
-    fprintf(f, " */\n");
-    fclose(f);
+    if (f) {
+      fprintf(f, "%s", translated_disassembly_.c_str());
+      fprintf(f, "/*\n");
+      fprintf(f, "%s", ucode_disassembly_.c_str());
+      fprintf(f, " */\n");
+      fclose(f);
+    }
   }
 
   program_ = glCreateShaderProgramv(shader_type_ == ShaderType::kVertex
@@ -374,7 +359,7 @@ bool GL4Shader::CompileProgram(std::string source) {
                                         : GL_FRAGMENT_SHADER,
                                     1, &source_str);
   if (!program_) {
-    PLOGE("Unable to create shader program");
+    XELOGE("Unable to create shader program");
     return false;
   }
 
@@ -389,7 +374,7 @@ bool GL4Shader::CompileProgram(std::string source) {
     info_log.resize(log_length - 1);
     glGetProgramInfoLog(program_, log_length, &log_length,
                         const_cast<char*>(info_log.data()));
-    PLOGE("Unable to link program: %s", info_log.c_str());
+    XELOGE("Unable to link program: %s", info_log.c_str());
     error_log_ = std::move(info_log);
     assert_always("Unable to link generated shader");
     return false;
@@ -424,18 +409,22 @@ bool GL4Shader::CompileProgram(std::string source) {
       search_offset = p - search_start;
       ++search_offset;
     }
-    host_disassembly_ = std::string(disasm_start);
+    if (disasm_start) {
+      host_disassembly_ = std::string(disasm_start);
+    } else {
+      host_disassembly_ = std::string("Shader disassembly not available.");
+    }
 
     // Append to shader dump.
-    if (FLAGS_dump_shaders.size()) {
+    if (!FLAGS_dump_shaders.empty()) {
       if (disasm_start) {
         FILE* f = fopen(file_name, "a");
         fprintf(f, "\n\n/*\n");
-        fprintf(f, disasm_start);
+        fprintf(f, "%s", disasm_start);
         fprintf(f, "\n*/\n");
         fclose(f);
       } else {
-        PLOGW("Got program binary but unable to find disassembly");
+        XELOGW("Got program binary but unable to find disassembly");
       }
     }
   }

@@ -11,7 +11,7 @@
 
 #include "xenia/cpu/backend/backend.h"
 #include "xenia/cpu/compiler/compiler.h"
-#include "xenia/cpu/runtime.h"
+#include "xenia/cpu/processor.h"
 #include "xenia/profiling.h"
 
 namespace xe {
@@ -28,13 +28,13 @@ FinalizationPass::FinalizationPass() : CompilerPass() {}
 
 FinalizationPass::~FinalizationPass() {}
 
-int FinalizationPass::Run(HIRBuilder* builder) {
+bool FinalizationPass::Run(HIRBuilder* builder) {
   // Process the HIR and prepare it for lowering.
   // After this is done the HIR should be ready for emitting.
 
   auto arena = builder->arena();
 
-  uint32_t block_ordinal = 0;
+  uint16_t block_ordinal = 0;
   auto block = builder->first_block();
   while (block) {
     block->ordinal = block_ordinal++;
@@ -65,7 +65,7 @@ int FinalizationPass::Run(HIRBuilder* builder) {
     block = block->next;
   }
 
-  return 0;
+  return true;
 }
 
 }  // namespace passes

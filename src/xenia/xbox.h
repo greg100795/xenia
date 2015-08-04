@@ -12,21 +12,17 @@
 
 #include <string>
 
-#include "poly/memory.h"
-#include "xenia/common.h"
+#include "xenia/base/memory.h"
+
+// TODO(benvanik): split this header, cleanup, etc.
+// clang-format off
 
 namespace xe {
 
-template <typename T>
-using be = poly::be<T>;
-
-
 #pragma pack(push, 4)
 
-
 typedef uint32_t X_HANDLE;
-#define X_INVALID_HANDLE_VALUE  ((X_HANDLE)-1)
-
+#define X_INVALID_HANDLE_VALUE ((X_HANDLE)-1)
 
 // TODO(benvanik): type all of this so we get some safety.
 
@@ -48,6 +44,7 @@ typedef uint32_t X_STATUS;
 #define X_STATUS_NO_MORE_FILES                          ((X_STATUS)0x80000006L)
 #define X_STATUS_UNSUCCESSFUL                           ((X_STATUS)0xC0000001L)
 #define X_STATUS_NOT_IMPLEMENTED                        ((X_STATUS)0xC0000002L)
+#define X_STATUS_INVALID_INFO_CLASS                     ((X_STATUS)0xC0000003L)
 #define X_STATUS_INFO_LENGTH_MISMATCH                   ((X_STATUS)0xC0000004L)
 #define X_STATUS_ACCESS_VIOLATION                       ((X_STATUS)0xC0000005L)
 #define X_STATUS_INVALID_HANDLE                         ((X_STATUS)0xC0000008L)
@@ -63,10 +60,15 @@ typedef uint32_t X_STATUS;
 #define X_STATUS_OBJECT_NAME_COLLISION                  ((X_STATUS)0xC0000035L)
 #define X_STATUS_INVALID_PAGE_PROTECTION                ((X_STATUS)0xC0000045L)
 #define X_STATUS_MUTANT_NOT_OWNED                       ((X_STATUS)0xC0000046L)
+#define X_STATUS_INSUFFICIENT_RESOURCES                 ((X_STATUS)0xC000009AL)
 #define X_STATUS_MEMORY_NOT_ALLOCATED                   ((X_STATUS)0xC00000A0L)
 #define X_STATUS_INVALID_PARAMETER_1                    ((X_STATUS)0xC00000EFL)
 #define X_STATUS_INVALID_PARAMETER_2                    ((X_STATUS)0xC00000F0L)
 #define X_STATUS_INVALID_PARAMETER_3                    ((X_STATUS)0xC00000F1L)
+#define X_STATUS_DLL_NOT_FOUND                          ((X_STATUS)0xC0000135L)
+#define X_STATUS_NOT_FOUND                              ((X_STATUS)0xC0000225L)
+#define X_STATUS_DRIVER_ORDINAL_NOT_FOUND               ((X_STATUS)0xC0000262L)
+#define X_STATUS_DRIVER_ENTRYPOINT_NOT_FOUND            ((X_STATUS)0xC0000263L)
 
 // HRESULT (ERROR_*)
 // Adding as needed.
@@ -77,9 +79,10 @@ typedef uint32_t X_RESULT;
 #define X_RESULT_FROM_WIN32(x) x //((X_RESULT)(x) <= 0 ? ((X_RESULT)(x)) : ((X_RESULT) (((x) & 0x0000FFFF) | (X_FACILITY_WIN32 << 16) | 0x80000000)))
 #define X_ERROR_SUCCESS                                 X_RESULT_FROM_WIN32(0x00000000L)
 #define X_ERROR_FILE_NOT_FOUND                          X_RESULT_FROM_WIN32(0x00000002L)
+#define X_ERROR_PATH_NOT_FOUND                          X_RESULT_FROM_WIN32(0x00000003L)
 #define X_ERROR_ACCESS_DENIED                           X_RESULT_FROM_WIN32(0x00000005L)
 #define X_ERROR_INVALID_HANDLE                          X_RESULT_FROM_WIN32(0x00000006L)
-#define X_ERROR_NO_MORE_FILES                           X_RESULT_FROM_WIN32(0x00000018L)
+#define X_ERROR_NO_MORE_FILES                           X_RESULT_FROM_WIN32(0x00000012L)
 #define X_ERROR_INVALID_PARAMETER                       X_RESULT_FROM_WIN32(0x00000057L)
 #define X_ERROR_IO_PENDING                              X_RESULT_FROM_WIN32(0x000003E5L)
 #define X_ERROR_INSUFFICIENT_BUFFER                     X_RESULT_FROM_WIN32(0x0000007AL)
@@ -114,15 +117,6 @@ typedef uint32_t X_HRESULT;
 #define X_MEM_HEAP                0x40000000
 #define X_MEM_16MB_PAGES          0x80000000 // from Valve SDK
 
-// FILE_*, used by NtOpenFile
-#define X_FILE_SUPERSEDED         0x00000000
-#define X_FILE_OPENED             0x00000001
-#define X_FILE_CREATED            0x00000002
-#define X_FILE_OVERWRITTEN        0x00000003
-#define X_FILE_EXISTS             0x00000004
-#define X_FILE_DOES_NOT_EXIST     0x00000005
-
-
 // PAGE_*, used by NtAllocateVirtualMemory
 #define X_PAGE_NOACCESS           0x00000001
 #define X_PAGE_READONLY           0x00000002
@@ -136,45 +130,25 @@ typedef uint32_t X_HRESULT;
 #define X_PAGE_NOCACHE            0x00000200
 #define X_PAGE_WRITECOMBINE       0x00000400
 
-
-// (?), used by KeGetCurrentProcessType
-#define X_PROCTYPE_IDLE   0
-#define X_PROCTYPE_USER   1
-#define X_PROCTYPE_SYSTEM 2
-
-
 // Sockets/networking.
-#define X_INVALID_SOCKET          (uint32_t)(~0)
-#define X_SOCKET_ERROR            (uint32_t)(-1)
+#define X_INVALID_SOCKET (uint32_t)(~0)
+#define X_SOCKET_ERROR (uint32_t)(-1)
 
+// clang-format on
 
-// Thread enums.
-#define X_CREATE_SUSPENDED        0x00000004
-
-
-// TLS specials.
-#define X_TLS_OUT_OF_INDEXES      UINT32_MAX  // (-1)
-
-
-// Languages.
-#define X_LANGUAGE_ENGLISH        1
-#define X_LANGUAGE_JAPANESE       2
-
-
-enum X_FILE_ATTRIBUTES {
-  X_FILE_ATTRIBUTE_NONE         = 0x0000,
-  X_FILE_ATTRIBUTE_READONLY     = 0x0001,
-  X_FILE_ATTRIBUTE_HIDDEN       = 0x0002,
-  X_FILE_ATTRIBUTE_SYSTEM       = 0x0004,
-  X_FILE_ATTRIBUTE_DIRECTORY    = 0x0010,
-  X_FILE_ATTRIBUTE_ARCHIVE      = 0x0020,
-  X_FILE_ATTRIBUTE_DEVICE       = 0x0040,
-  X_FILE_ATTRIBUTE_NORMAL       = 0x0080,
-  X_FILE_ATTRIBUTE_TEMPORARY    = 0x0100,
-  X_FILE_ATTRIBUTE_COMPRESSED   = 0x0800,
-  X_FILE_ATTRIBUTE_ENCRYPTED    = 0x4000,
+enum X_FILE_ATTRIBUTES : uint32_t {
+  X_FILE_ATTRIBUTE_NONE = 0x0000,
+  X_FILE_ATTRIBUTE_READONLY = 0x0001,
+  X_FILE_ATTRIBUTE_HIDDEN = 0x0002,
+  X_FILE_ATTRIBUTE_SYSTEM = 0x0004,
+  X_FILE_ATTRIBUTE_DIRECTORY = 0x0010,
+  X_FILE_ATTRIBUTE_ARCHIVE = 0x0020,
+  X_FILE_ATTRIBUTE_DEVICE = 0x0040,
+  X_FILE_ATTRIBUTE_NORMAL = 0x0080,
+  X_FILE_ATTRIBUTE_TEMPORARY = 0x0100,
+  X_FILE_ATTRIBUTE_COMPRESSED = 0x0800,
+  X_FILE_ATTRIBUTE_ENCRYPTED = 0x4000,
 };
-
 
 // http://code.google.com/p/vdash/source/browse/trunk/vdash/include/kernel.h
 enum X_FILE_INFORMATION_CLASS {
@@ -217,87 +191,131 @@ enum X_FILE_INFORMATION_CLASS {
   XFileMaximumInformation
 };
 
+// Known as XOVERLAPPED to 360 code.
+struct XAM_OVERLAPPED {
+  xe::be<uint32_t> result;              // 0x0
+  xe::be<uint32_t> length;              // 0x4
+  xe::be<uint32_t> context;             // 0x8
+  xe::be<uint32_t> event;               // 0xC
+  xe::be<uint32_t> completion_routine;  // 0x10
+  xe::be<uint32_t> completion_context;  // 0x14
+  xe::be<uint32_t> extended_error;      // 0x18
+};
+
+inline uint32_t XOverlappedGetResult(void* ptr) {
+  auto p = reinterpret_cast<uint32_t*>(ptr);
+  return xe::load_and_swap<uint32_t>(&p[0]);
+}
 inline void XOverlappedSetResult(void* ptr, uint32_t value) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
-  poly::store_and_swap<uint32_t>(&p[0], value);
+  xe::store_and_swap<uint32_t>(&p[0], value);
+}
+inline uint32_t XOverlappedGetLength(void* ptr) {
+  auto p = reinterpret_cast<uint32_t*>(ptr);
+  return xe::load_and_swap<uint32_t>(&p[1]);
 }
 inline void XOverlappedSetLength(void* ptr, uint32_t value) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
-  poly::store_and_swap<uint32_t>(&p[1], value);
+  xe::store_and_swap<uint32_t>(&p[1], value);
 }
 inline uint32_t XOverlappedGetContext(void* ptr) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
-  return poly::load_and_swap<uint32_t>(&p[2]);
+  return xe::load_and_swap<uint32_t>(&p[2]);
 }
 inline void XOverlappedSetContext(void* ptr, uint32_t value) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
-  poly::store_and_swap<uint32_t>(&p[2], value);
+  xe::store_and_swap<uint32_t>(&p[2], value);
 }
 inline X_HANDLE XOverlappedGetEvent(void* ptr) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
-  return poly::load_and_swap<uint32_t>(&p[3]);
+  return xe::load_and_swap<uint32_t>(&p[3]);
 }
 inline uint32_t XOverlappedGetCompletionRoutine(void* ptr) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
-  return poly::load_and_swap<uint32_t>(&p[4]);
+  return xe::load_and_swap<uint32_t>(&p[4]);
 }
 inline uint32_t XOverlappedGetCompletionContext(void* ptr) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
-  return poly::load_and_swap<uint32_t>(&p[5]);
+  return xe::load_and_swap<uint32_t>(&p[5]);
 }
 inline void XOverlappedSetExtendedError(void* ptr, uint32_t value) {
   auto p = reinterpret_cast<uint32_t*>(ptr);
-  poly::store_and_swap<uint32_t>(&p[6], value);
+  xe::store_and_swap<uint32_t>(&p[6], value);
 }
 
-class X_ANSI_STRING {
-private:
-  uint16_t    length;
-  uint16_t    maximum_length;
-  const char* buffer;
+struct X_ANSI_STRING {
+  xe::be<uint16_t> length;
+  xe::be<uint16_t> maximum_length;
+  xe::be<uint32_t> pointer;
 
-public:
-  X_ANSI_STRING() {
-    Zero();
-  }
-  X_ANSI_STRING(const uint8_t* base, uint32_t p) {
-    Read(base, p);
-  }
-  void Read(const uint8_t* base, uint32_t p) {
-    length = poly::load_and_swap<uint16_t>(base + p);
-    maximum_length = poly::load_and_swap<uint16_t>(base + p + 2);
-    if (maximum_length) {
-      buffer = (const char*)(base + poly::load_and_swap<uint32_t>(base + p + 4));
-    } else {
-      buffer = 0;
-    }
-  }
-  void Zero() {
-    length = maximum_length = 0;
-    buffer = 0;
-  }
-  char* Duplicate() {
-    if (!buffer || !length) {
+  static X_ANSI_STRING* Translate(uint8_t* membase, uint32_t guest_address) {
+    if (!guest_address) {
       return nullptr;
     }
-    auto copy = (char*)calloc(length + 1, sizeof(char));
-    std::strncpy(copy, buffer, length);
-    return copy;
+    return reinterpret_cast<X_ANSI_STRING*>(membase + guest_address);
   }
-  std::string to_string() {
-    if (!buffer || !length) {
+
+  static X_ANSI_STRING* TranslateIndirect(uint8_t* membase,
+                                          uint32_t guest_address_ptr) {
+    if (!guest_address_ptr) {
+      return nullptr;
+    }
+    uint32_t guest_address =
+        xe::load_and_swap<uint32_t>(membase + guest_address_ptr);
+    return Translate(membase, guest_address);
+  }
+
+  static std::string to_string(uint8_t* membase, uint32_t guest_address) {
+    auto str = Translate(membase, guest_address);
+    return str ? str->to_string(membase) : "";
+  }
+
+  static std::string to_string_indirect(uint8_t* membase,
+                                        uint32_t guest_address_ptr) {
+    auto str = TranslateIndirect(membase, guest_address_ptr);
+    return str ? str->to_string(membase) : "";
+  }
+
+  void reset() {
+    length = 0;
+    maximum_length = 0;
+    pointer = 0;
+  }
+
+  std::string to_string(uint8_t* membase) const {
+    if (!length) {
       return "";
     }
-    std::string result(buffer, length);
-    return result;
+    return std::string(reinterpret_cast<const char*>(membase + pointer),
+                       length);
   }
 };
-//static_assert_size(X_ANSI_STRING, 8);
+static_assert_size(X_ANSI_STRING, 8);
 
+struct X_UNICODE_STRING {
+  xe::be<uint16_t> length;          // 0x0
+  xe::be<uint16_t> maximum_length;  // 0x2
+  xe::be<uint32_t> pointer;         // 0x4
 
-// Values seem to be all over the place - GUIDs?
+  void reset() {
+    length = 0;
+    maximum_length = 0;
+    pointer = 0;
+  }
+
+  std::wstring to_string(uint8_t* membase) const {
+    if (!length) {
+      return L"";
+    }
+
+    return std::wstring(reinterpret_cast<const wchar_t*>(membase + pointer),
+                        length);
+  }
+};
+static_assert_size(X_UNICODE_STRING, 8);
+
+// http://pastebin.com/SMypYikG
 typedef uint32_t XNotificationID;
-
 
 // http://ffplay360.googlecode.com/svn/trunk/Common/XTLOnPC.h
 struct X_VIDEO_MODE {
@@ -314,72 +332,57 @@ struct X_VIDEO_MODE {
 };
 static_assert_size(X_VIDEO_MODE, 48);
 
-enum X_INPUT_FLAG {
-  X_INPUT_FLAG_GAMEPAD = 0x00000001,
+struct X_LIST_ENTRY {
+  be<uint32_t> flink_ptr;  // next entry / head
+  be<uint32_t> blink_ptr;  // previous entry / head
+
+  // Assumes X_LIST_ENTRY is within guest memory!
+  void initialize(uint8_t* virtual_membase) {
+    flink_ptr = (uint32_t)((uint8_t*)this - virtual_membase);
+    blink_ptr = (uint32_t)((uint8_t*)this - virtual_membase);
+  }
+};
+static_assert_size(X_LIST_ENTRY, 8);
+
+struct X_SINGLE_LIST_ENTRY {
+  be<uint32_t> next;  // 0x0 pointer to next entry
+};
+static_assert_size(X_SINGLE_LIST_ENTRY, 4);
+
+// http://www.nirsoft.net/kernel_struct/vista/SLIST_HEADER.html
+struct X_SLIST_HEADER {
+  X_SINGLE_LIST_ENTRY next;  // 0x0
+  be<uint16_t> depth;        // 0x4
+  be<uint16_t> sequence;     // 0x6
+};
+static_assert_size(X_SLIST_HEADER, 8);
+
+// https://msdn.microsoft.com/en-us/library/windows/hardware/ff550671(v=vs.85).aspx
+struct X_IO_STATUS_BLOCK {
+  union {
+    xe::be<X_STATUS> status;
+    xe::be<uint32_t> pointer;
+  };
+  xe::be<uint32_t> information;
 };
 
-enum X_INPUT_GAMEPAD_BUTTON {
-  X_INPUT_GAMEPAD_DPAD_UP = 0x0001,
-  X_INPUT_GAMEPAD_DPAD_DOWN = 0x0002,
-  X_INPUT_GAMEPAD_DPAD_LEFT = 0x0004,
-  X_INPUT_GAMEPAD_DPAD_RIGHT = 0x0008,
-  X_INPUT_GAMEPAD_START = 0x0010,
-  X_INPUT_GAMEPAD_BACK = 0x0020,
-  X_INPUT_GAMEPAD_LEFT_THUMB = 0x0040,
-  X_INPUT_GAMEPAD_RIGHT_THUMB = 0x0080,
-  X_INPUT_GAMEPAD_LEFT_SHOULDER = 0x0100,
-  X_INPUT_GAMEPAD_RIGHT_SHOULDER = 0x0200,
-  X_INPUT_GAMEPAD_A = 0x1000,
-  X_INPUT_GAMEPAD_B = 0x2000,
-  X_INPUT_GAMEPAD_X = 0x4000,
-  X_INPUT_GAMEPAD_Y = 0x8000,
+struct X_EX_TITLE_TERMINATE_REGISTRATION {
+  xe::be<uint32_t> notification_routine;  // 0x0
+  xe::be<uint32_t> priority;              // 0x4
+  X_LIST_ENTRY list_entry;                // 0x8 ??
 };
+static_assert_size(X_EX_TITLE_TERMINATE_REGISTRATION, 16);
 
-struct X_INPUT_GAMEPAD {
-  be<uint16_t> buttons;
-  be<uint8_t> left_trigger;
-  be<uint8_t> right_trigger;
-  be<int16_t> thumb_lx;
-  be<int16_t> thumb_ly;
-  be<int16_t> thumb_rx;
-  be<int16_t> thumb_ry;
+struct X_OBJECT_ATTRIBUTES {
+  xe::be<uint32_t> root_directory;  // 0x0
+  xe::be<uint32_t> name_ptr;        // 0x4 PANSI_STRING
+  xe::be<uint32_t> attributes;      // 0xC
 };
-static_assert_size(X_INPUT_GAMEPAD, 12);
-
-struct X_INPUT_STATE {
-  be<uint32_t> packet_number;
-  X_INPUT_GAMEPAD gamepad;
-};
-static_assert_size(X_INPUT_STATE, sizeof(X_INPUT_GAMEPAD) + 4);
-
-struct X_INPUT_VIBRATION {
-  be<uint16_t> left_motor_speed;
-  be<uint16_t> right_motor_speed;
-};
-static_assert_size(X_INPUT_VIBRATION, 4);
-
-struct X_INPUT_CAPABILITIES {
-  be<uint8_t> type;
-  be<uint8_t> sub_type;
-  be<uint16_t> flags;
-  X_INPUT_GAMEPAD gamepad;
-  X_INPUT_VIBRATION vibration;
-};
-static_assert_size(X_INPUT_CAPABILITIES,
-                   sizeof(X_INPUT_GAMEPAD) + sizeof(X_INPUT_VIBRATION) + 4);
-
-// http://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinput_keystroke(v=vs.85).aspx
-struct X_INPUT_KEYSTROKE {
-  be<uint16_t> virtual_key;
-  be<uint16_t> unicode;
-  be<uint16_t> flags;
-  be<uint8_t> user_index;
-  be<uint8_t> hid_code;
-};
-static_assert_size(X_INPUT_KEYSTROKE, 8);
 
 #pragma pack(pop)
 
 }  // namespace xe
+
+// clang-format on
 
 #endif  // XENIA_XBOX_H_

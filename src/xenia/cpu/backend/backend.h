@@ -16,7 +16,7 @@
 
 namespace xe {
 namespace cpu {
-class Runtime;
+class Processor;
 }  // namespace cpu
 }  // namespace xe
 
@@ -25,25 +25,31 @@ namespace cpu {
 namespace backend {
 
 class Assembler;
+class CodeCache;
 
 class Backend {
  public:
-  Backend(Runtime* runtime);
+  Backend(Processor* processor);
   virtual ~Backend();
 
-  Runtime* runtime() const { return runtime_; }
+  Processor* processor() const { return processor_; }
   const MachineInfo* machine_info() const { return &machine_info_; }
+  CodeCache* code_cache() const { return code_cache_; }
 
-  virtual int Initialize();
+  virtual bool Initialize();
 
   virtual void* AllocThreadData();
   virtual void FreeThreadData(void* thread_data);
 
+  virtual void CommitExecutableRange(uint32_t guest_low,
+                                     uint32_t guest_high) = 0;
+
   virtual std::unique_ptr<Assembler> CreateAssembler() = 0;
 
  protected:
-  Runtime* runtime_;
+  Processor* processor_;
   MachineInfo machine_info_;
+  CodeCache* code_cache_;
 };
 
 }  // namespace backend

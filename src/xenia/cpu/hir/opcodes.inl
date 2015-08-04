@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+// clang-format off
 
 DEFINE_OPCODE(
     OPCODE_COMMENT,
@@ -24,12 +25,6 @@ DEFINE_OPCODE(
     OPCODE_SOURCE_OFFSET,
     "source_offset",
     OPCODE_SIG_X_O,
-    OPCODE_FLAG_IGNORE | OPCODE_FLAG_HIDE)
-
-DEFINE_OPCODE(
-    OPCODE_TRACE_SOURCE,
-    "trace_source",
-    OPCODE_SIG_X_O_V_V,
     OPCODE_FLAG_IGNORE | OPCODE_FLAG_HIDE)
 
 DEFINE_OPCODE(
@@ -219,6 +214,18 @@ DEFINE_OPCODE(
     0)
 
 DEFINE_OPCODE(
+    OPCODE_LOAD_MMIO,
+    "load_mmio",
+    OPCODE_SIG_V_O_O,
+    OPCODE_FLAG_MEMORY)
+
+DEFINE_OPCODE(
+    OPCODE_STORE_MMIO,
+    "store_mmio",
+    OPCODE_SIG_X_O_O_V,
+    OPCODE_FLAG_MEMORY)
+
+DEFINE_OPCODE(
     OPCODE_LOAD,
     "load",
     OPCODE_SIG_V_V,
@@ -229,6 +236,12 @@ DEFINE_OPCODE(
     "store",
     OPCODE_SIG_X_V_V,
     OPCODE_FLAG_MEMORY)
+
+DEFINE_OPCODE(
+    OPCODE_MEMSET,
+    "memset",
+    OPCODE_SIG_X_V_V_V,
+    0)
 
 DEFINE_OPCODE(
     OPCODE_PREFETCH,
@@ -329,16 +342,6 @@ DEFINE_OPCODE(
     OPCODE_SIG_V_V_V,
     0)
 
-DEFINE_OPCODE(
-    OPCODE_DID_CARRY,
-    "did_carry",
-    OPCODE_SIG_V_V,
-    OPCODE_FLAG_PAIRED_PREV)
-DEFINE_OPCODE(
-    OPCODE_DID_OVERFLOW,
-    "did_overflow",
-    OPCODE_SIG_V_V,
-    OPCODE_FLAG_PAIRED_PREV)
 DEFINE_OPCODE(
     OPCODE_DID_SATURATE,
     "did_saturate",
@@ -612,25 +615,7 @@ DEFINE_OPCODE(
     0)
 
 DEFINE_OPCODE(
-    OPCODE_COMPARE_EXCHANGE,
-    "compare_exchange",
-    OPCODE_SIG_V_V_V_V,
-    OPCODE_FLAG_VOLATILE)
-
-DEFINE_OPCODE(
     OPCODE_ATOMIC_EXCHANGE,
     "atomic_exchange",
     OPCODE_SIG_V_V_V,
     OPCODE_FLAG_VOLATILE)
-
-DEFINE_OPCODE(
-    OPCODE_ATOMIC_ADD,
-    "atomic_add",
-    OPCODE_SIG_V_V_V,
-    0)
-
-DEFINE_OPCODE(
-    OPCODE_ATOMIC_SUB,
-    "atomic_sub",
-    OPCODE_SIG_V_V_V,
-    0)

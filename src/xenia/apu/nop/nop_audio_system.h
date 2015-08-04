@@ -10,30 +10,26 @@
 #ifndef XENIA_APU_NOP_NOP_AUDIO_SYSTEM_H_
 #define XENIA_APU_NOP_NOP_AUDIO_SYSTEM_H_
 
-#include "xenia/common.h"
-
 #include "xenia/apu/audio_system.h"
-#include "xenia/apu/nop/nop_apu-private.h"
-
 
 namespace xe {
 namespace apu {
 namespace nop {
 
-
 class NopAudioSystem : public AudioSystem {
-public:
+ public:
   NopAudioSystem(Emulator* emulator);
-  virtual ~NopAudioSystem();
+  ~NopAudioSystem() override;
 
-  virtual X_STATUS CreateDriver(size_t index, HANDLE wait_handle, AudioDriver** out_driver);
-  virtual void DestroyDriver(AudioDriver* driver);
+  static std::unique_ptr<AudioSystem> Create(Emulator* emulator);
+
+  X_STATUS CreateDriver(size_t index, xe::threading::Semaphore* semaphore,
+                        AudioDriver** out_driver) override;
+  void DestroyDriver(AudioDriver* driver) override;
 };
-
 
 }  // namespace nop
 }  // namespace apu
 }  // namespace xe
-
 
 #endif  // XENIA_APU_NOP_NOP_AUDIO_SYSTEM_H_

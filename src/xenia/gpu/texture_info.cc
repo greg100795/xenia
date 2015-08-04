@@ -9,9 +9,11 @@
 
 #include "xenia/gpu/texture_info.h"
 
+#include <cstring>
+
 #include "third_party/xxhash/xxhash.h"
 
-#include "poly/math.h"
+#include "xenia/base/math.h"
 
 namespace xe {
 namespace gpu {
@@ -178,10 +180,10 @@ void TextureInfo::CalculateTextureSizes2D(const xe_gpu_texture_fetch_t& fetch) {
 
   // w/h in blocks must be a multiple of block size.
   uint32_t block_width =
-      poly::round_up(size_2d.logical_width, format_info->block_width) /
+      xe::round_up(size_2d.logical_width, format_info->block_width) /
       format_info->block_width;
   uint32_t block_height =
-      poly::round_up(size_2d.logical_height, format_info->block_height) /
+      xe::round_up(size_2d.logical_height, format_info->block_height) /
       format_info->block_height;
 
   // Tiles are 32x32 blocks. All textures must be multiples of tile dimensions.
@@ -196,7 +198,7 @@ void TextureInfo::CalculateTextureSizes2D(const xe_gpu_texture_fetch_t& fetch) {
   uint32_t byte_pitch = tile_width * 32 * bytes_per_block;
   if (!is_tiled) {
     // Each row must be a multiple of 256 in linear textures.
-    byte_pitch = poly::round_up(byte_pitch, 256);
+    byte_pitch = xe::round_up(byte_pitch, 256);
   }
 
   size_2d.input_width = tile_width * 32 * format_info->block_width;
@@ -212,18 +214,19 @@ void TextureInfo::CalculateTextureSizes2D(const xe_gpu_texture_fetch_t& fetch) {
   output_length = size_2d.output_pitch * block_height;
 }
 
-void TextureInfo::CalculateTextureSizesCube(const xe_gpu_texture_fetch_t& fetch) {
+void TextureInfo::CalculateTextureSizesCube(
+    const xe_gpu_texture_fetch_t& fetch) {
   assert_true(fetch.size_stack.depth + 1 == 6);
   size_cube.logical_width = 1 + fetch.size_stack.width;
   size_cube.logical_height = 1 + fetch.size_stack.height;
 
   // w/h in blocks must be a multiple of block size.
   uint32_t block_width =
-    poly::round_up(size_cube.logical_width, format_info->block_width) /
-    format_info->block_width;
+      xe::round_up(size_cube.logical_width, format_info->block_width) /
+      format_info->block_width;
   uint32_t block_height =
-    poly::round_up(size_cube.logical_height, format_info->block_height) /
-    format_info->block_height;
+      xe::round_up(size_cube.logical_height, format_info->block_height) /
+      format_info->block_height;
 
   // Tiles are 32x32 blocks. All textures must be multiples of tile dimensions.
   uint32_t tile_width = uint32_t(std::ceilf(block_width / 32.0f));
@@ -232,12 +235,12 @@ void TextureInfo::CalculateTextureSizesCube(const xe_gpu_texture_fetch_t& fetch)
   size_cube.block_height = tile_height * 32;
 
   uint32_t bytes_per_block = format_info->block_width *
-    format_info->block_height *
-    format_info->bits_per_pixel / 8;
+                             format_info->block_height *
+                             format_info->bits_per_pixel / 8;
   uint32_t byte_pitch = tile_width * 32 * bytes_per_block;
   if (!is_tiled) {
     // Each row must be a multiple of 256 in linear textures.
-    byte_pitch = poly::round_up(byte_pitch, 256);
+    byte_pitch = xe::round_up(byte_pitch, 256);
   }
 
   size_cube.input_width = tile_width * 32 * format_info->block_width;
@@ -297,8 +300,8 @@ void TextureInfo::GetPackedTileOffset(const TextureInfo& texture_info,
     return;
   }
 
-  if (poly::log2_ceil(texture_info.size_2d.logical_width) >
-      poly::log2_ceil(texture_info.size_2d.logical_height)) {
+  if (xe::log2_ceil(texture_info.size_2d.logical_width) >
+      xe::log2_ceil(texture_info.size_2d.logical_height)) {
     // Wider than tall. Laid out vertically.
     *out_offset_x = 0;
     *out_offset_y = 16;

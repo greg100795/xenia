@@ -12,13 +12,14 @@
 
 #include <string>
 
-#include "xenia/common.h"
-#include "xenia/gpu/gl4/gl_context.h"
 #include "xenia/gpu/shader.h"
+#include "xenia/ui/gl/gl_context.h"
 
 namespace xe {
 namespace gpu {
 namespace gl4 {
+
+class GL4ShaderTranslator;
 
 class GL4Shader : public Shader {
  public:
@@ -29,8 +30,10 @@ class GL4Shader : public Shader {
   GLuint program() const { return program_; }
   GLuint vao() const { return vao_; }
 
-  bool PrepareVertexShader(const xenos::xe_gpu_program_cntl_t& program_cntl);
-  bool PreparePixelShader(const xenos::xe_gpu_program_cntl_t& program_cntl);
+  bool PrepareVertexShader(GL4ShaderTranslator* shader_translator,
+                           const xenos::xe_gpu_program_cntl_t& program_cntl);
+  bool PreparePixelShader(GL4ShaderTranslator* shader_translator,
+                          const xenos::xe_gpu_program_cntl_t& program_cntl);
 
  protected:
   std::string GetHeader();

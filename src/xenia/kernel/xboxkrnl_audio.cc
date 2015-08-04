@@ -7,8 +7,8 @@
  ******************************************************************************
  */
 
-#include "xenia/apu/apu.h"
-#include "xenia/common.h"
+#include "xenia/apu/audio_system.h"
+#include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -18,8 +18,8 @@
 namespace xe {
 namespace kernel {
 
-SHIM_CALL XAudioGetSpeakerConfig_shim(PPCContext* ppc_state,
-                                      KernelState* state) {
+SHIM_CALL XAudioGetSpeakerConfig_shim(PPCContext* ppc_context,
+                                      KernelState* kernel_state) {
   uint32_t config_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("XAudioGetSpeakerConfig(%.8X)", config_ptr);
@@ -29,8 +29,8 @@ SHIM_CALL XAudioGetSpeakerConfig_shim(PPCContext* ppc_state,
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
 }
 
-SHIM_CALL XAudioGetVoiceCategoryVolumeChangeMask_shim(PPCContext* ppc_state,
-                                                      KernelState* state) {
+SHIM_CALL XAudioGetVoiceCategoryVolumeChangeMask_shim(
+    PPCContext* ppc_context, KernelState* kernel_state) {
   uint32_t driver_ptr = SHIM_GET_ARG_32(0);
   uint32_t out_ptr = SHIM_GET_ARG_32(1);
 
@@ -39,8 +39,6 @@ SHIM_CALL XAudioGetVoiceCategoryVolumeChangeMask_shim(PPCContext* ppc_state,
 
   assert_true((driver_ptr & 0xFFFF0000) == 0x41550000);
 
-  auto audio_system = state->emulator()->audio_system();
-
   // Checking these bits to see if any voice volume changed.
   // I think.
   SHIM_SET_MEM_32(out_ptr, 0);
@@ -48,20 +46,21 @@ SHIM_CALL XAudioGetVoiceCategoryVolumeChangeMask_shim(PPCContext* ppc_state,
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
 }
 
-SHIM_CALL XAudioGetVoiceCategoryVolume_shim(PPCContext* ppc_state,
-                                            KernelState* state) {
+SHIM_CALL XAudioGetVoiceCategoryVolume_shim(PPCContext* ppc_context,
+                                            KernelState* kernel_state) {
   uint32_t unk = SHIM_GET_ARG_32(0);
   uint32_t out_ptr = SHIM_GET_ARG_32(1);
 
   XELOGD("XAudioGetVoiceCategoryVolume(%.8X, %.8X)", unk, out_ptr);
 
   // Expects a floating point single. Volume %?
-  SHIM_SET_MEM_F32(out_ptr, 1.0f);
+  xe::store_and_swap<float>(SHIM_MEM_ADDR(out_ptr), 1.0f);
 
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
 }
 
-SHIM_CALL XAudioEnableDucker_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL XAudioEnableDucker_shim(PPCContext* ppc_context,
+                                  KernelState* kernel_state) {
   uint32_t unk = SHIM_GET_ARG_32(0);
 
   XELOGD("XAudioEnableDucker(%.8X)", unk);
@@ -69,8 +68,8 @@ SHIM_CALL XAudioEnableDucker_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
 }
 
-SHIM_CALL XAudioRegisterRenderDriverClient_shim(PPCContext* ppc_state,
-                                                KernelState* state) {
+SHIM_CALL XAudioRegisterRenderDriverClient_shim(PPCContext* ppc_context,
+                                                KernelState* kernel_state) {
   uint32_t callback_ptr = SHIM_GET_ARG_32(0);
   uint32_t driver_ptr = SHIM_GET_ARG_32(1);
 
@@ -80,7 +79,7 @@ SHIM_CALL XAudioRegisterRenderDriverClient_shim(PPCContext* ppc_state,
   XELOGD("XAudioRegisterRenderDriverClient(%.8X(%.8X, %.8X), %.8X)",
          callback_ptr, callback, callback_arg, driver_ptr);
 
-  auto audio_system = state->emulator()->audio_system();
+  auto audio_system = kernel_state->emulator()->audio_system();
 
   size_t index;
   auto result = audio_system->RegisterClient(callback, callback_arg, &index);
@@ -95,21 +94,21 @@ SHIM_CALL XAudioRegisterRenderDriverClient_shim(PPCContext* ppc_state,
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
 }
 
-SHIM_CALL XAudioUnregisterRenderDriverClient_shim(PPCContext* ppc_state,
-                                                  KernelState* state) {
+SHIM_CALL XAudioUnregisterRenderDriverClient_shim(PPCContext* ppc_context,
+                                                  KernelState* kernel_state) {
   uint32_t driver_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("XAudioUnregisterRenderDriverClient(%.8X)", driver_ptr);
 
   assert_true((driver_ptr & 0xFFFF0000) == 0x41550000);
 
-  auto audio_system = state->emulator()->audio_system();
+  auto audio_system = kernel_state->emulator()->audio_system();
   audio_system->UnregisterClient(driver_ptr & 0x0000FFFF);
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
 }
 
-SHIM_CALL XAudioSubmitRenderDriverFrame_shim(PPCContext* ppc_state,
-                                             KernelState* state) {
+SHIM_CALL XAudioSubmitRenderDriverFrame_shim(PPCContext* ppc_context,
+                                             KernelState* kernel_state) {
   uint32_t driver_ptr = SHIM_GET_ARG_32(0);
   uint32_t samples_ptr = SHIM_GET_ARG_32(1);
 
@@ -117,7 +116,7 @@ SHIM_CALL XAudioSubmitRenderDriverFrame_shim(PPCContext* ppc_state,
 
   assert_true((driver_ptr & 0xFFFF0000) == 0x41550000);
 
-  auto audio_system = state->emulator()->audio_system();
+  auto audio_system = kernel_state->emulator()->audio_system();
   audio_system->SubmitFrame(driver_ptr & 0x0000FFFF, samples_ptr);
 
   SHIM_SET_RETURN_32(X_ERROR_SUCCESS);
@@ -126,8 +125,8 @@ SHIM_CALL XAudioSubmitRenderDriverFrame_shim(PPCContext* ppc_state,
 }  // namespace kernel
 }  // namespace xe
 
-void xe::kernel::xboxkrnl::RegisterAudioExports(ExportResolver* export_resolver,
-                                                KernelState* state) {
+void xe::kernel::xboxkrnl::RegisterAudioExports(
+    xe::cpu::ExportResolver* export_resolver, KernelState* kernel_state) {
   // Additional XMA* methods are in xboxkrnl_audio_xma.cc.
 
   SHIM_SET_MAPPING("xboxkrnl.exe", XAudioGetSpeakerConfig, state);

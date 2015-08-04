@@ -7,9 +7,10 @@
  ******************************************************************************
  */
 
-#include "xenia/common.h"
+#include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/objects/xthread.h"
+#include "xenia/kernel/objects/xsemaphore.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl_private.h"
 #include "xenia/kernel/xobject.h"
@@ -18,7 +19,8 @@
 namespace xe {
 namespace kernel {
 
-SHIM_CALL ObOpenObjectByName_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL ObOpenObjectByName_shim(PPCContext* ppc_context,
+                                  KernelState* kernel_state) {
   // r3 = ptr to info?
   //   +0 = -4
   //   +4 = name ptr
@@ -31,15 +33,15 @@ SHIM_CALL ObOpenObjectByName_shim(PPCContext* ppc_state, KernelState* state) {
   uint32_t unk = SHIM_GET_ARG_32(2);
   uint32_t handle_ptr = SHIM_GET_ARG_32(3);
 
-  uint32_t name_str_ptr = SHIM_MEM_32(obj_attributes_ptr + 4);
-  X_ANSI_STRING name_str(SHIM_MEM_BASE, name_str_ptr);
-  auto name = name_str.to_string();
+  auto name =
+      X_ANSI_STRING::to_string_indirect(SHIM_MEM_BASE, obj_attributes_ptr + 4);
 
   XELOGD("ObOpenObjectByName(%.8X(name=%s), %.8X, %.8X, %.8X)",
          obj_attributes_ptr, name.c_str(), object_type_ptr, unk, handle_ptr);
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
-  X_STATUS result = state->object_table()->GetObjectByName(name, &handle);
+  X_STATUS result =
+      kernel_state->object_table()->GetObjectByName(name, &handle);
   if (XSUCCEEDED(result)) {
     SHIM_SET_MEM_32(handle_ptr, handle);
   }
@@ -47,8 +49,36 @@ SHIM_CALL ObOpenObjectByName_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL ObReferenceObjectByHandle_shim(PPCContext* ppc_state,
-                                         KernelState* state) {
+dword_result_t ObOpenObjectByPointer(lpvoid_t object_ptr,
+                                     lpdword_t out_handle_ptr) {
+  auto object = XObject::GetNativeObject<XObject>(kernel_state(), object_ptr);
+  if (!object) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  // Retain the handle. Will be released in NtClose.
+  object->RetainHandle();
+  *out_handle_ptr = object->handle();
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT(ObOpenObjectByPointer, ExportTag::kImplemented);
+
+dword_result_t ObLookupThreadByThreadId(dword_t thread_id,
+                                        lpdword_t out_object_ptr) {
+  auto thread = kernel_state()->GetThreadByID(thread_id);
+  if (!thread) {
+    return X_STATUS_NOT_FOUND;
+  }
+
+  // Retain the object. Will be released in ObDereferenceObject.
+  thread->Retain();
+  *out_object_ptr = thread->guest_object();
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT(ObLookupThreadByThreadId, ExportTag::kImplemented);
+
+SHIM_CALL ObReferenceObjectByHandle_shim(PPCContext* ppc_context,
+                                         KernelState* kernel_state) {
   uint32_t handle = SHIM_GET_ARG_32(0);
   uint32_t object_type_ptr = SHIM_GET_ARG_32(1);
   uint32_t out_object_ptr = SHIM_GET_ARG_32(2);
@@ -56,36 +86,65 @@ SHIM_CALL ObReferenceObjectByHandle_shim(PPCContext* ppc_state,
   XELOGD("ObReferenceObjectByHandle(%.8X, %.8X, %.8X)", handle, object_type_ptr,
          out_object_ptr);
 
-  X_STATUS result = X_STATUS_INVALID_HANDLE;
+  X_STATUS result = X_STATUS_SUCCESS;
 
-  XObject* object = NULL;
-  result = state->object_table()->GetObject(handle, &object);
-  if (XSUCCEEDED(result)) {
+  auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
+  if (object) {
     // TODO(benvanik): verify type with object_type_ptr
 
     // TODO(benvanik): get native value, if supported.
     uint32_t native_ptr;
     switch (object_type_ptr) {
-      case 0xD01BBEEF:  // ExThreadObjectType
-      {
-        XThread* thread = (XThread*)object;
-        native_ptr = thread->thread_state();
+      case 0x00000000: {  // whatever?
+        switch (object->type()) {
+          // TODO(benvanik): need to track native_ptr in XObject, allocate as
+          // needed?
+          /*case XObject::kTypeEvent: {
+            XEvent* ev = (XEvent*)object;
+          } break;*/
+          case XObject::kTypeThread: {
+            auto thread = object.get<XThread>();
+            native_ptr = thread->guest_object();
+          } break;
+          default: {
+            assert_unhandled_case(object->type());
+            native_ptr = 0xDEADF00D;
+          } break;
+        }
       } break;
-      default:
+      case 0xD017BEEF: {  // ExSemaphoreObjectType
+        assert(object->type() == XObject::kTypeSemaphore);
+        auto sem = object.get<XSemaphore>();
+
+        native_ptr = sem->guest_object();
+      } break;
+      case 0xD01BBEEF: {  // ExThreadObjectType
+        assert(object->type() == XObject::kTypeThread);
+        auto thread = object.get<XThread>();
+
+        native_ptr = thread->guest_object();
+      } break;
+      default: {
         assert_unhandled_case(object_type_ptr);
         native_ptr = 0xDEADF00D;
-        break;
+      } break;
     }
 
+    // Caller takes the reference.
+    // It's released in ObDereferenceObject.
+    object->Retain();
     if (out_object_ptr) {
       SHIM_SET_MEM_32(out_object_ptr, native_ptr);
     }
+  } else {
+    result = X_STATUS_INVALID_HANDLE;
   }
 
   SHIM_SET_RETURN_32(result);
 }
 
-SHIM_CALL ObDereferenceObject_shim(PPCContext* ppc_state, KernelState* state) {
+SHIM_CALL ObDereferenceObject_shim(PPCContext* ppc_context,
+                                   KernelState* kernel_state) {
   uint32_t native_ptr = SHIM_GET_ARG_32(0);
 
   XELOGD("ObDereferenceObject(%.8X)", native_ptr);
@@ -97,7 +156,7 @@ SHIM_CALL ObDereferenceObject_shim(PPCContext* ppc_state, KernelState* state) {
   }
 
   void* object_ptr = SHIM_MEM_ADDR(native_ptr);
-  XObject* object = XObject::GetObject(state, object_ptr);
+  auto object = XObject::GetNativeObject<XObject>(kernel_state, object_ptr);
   if (object) {
     object->Release();
   }
@@ -105,63 +164,42 @@ SHIM_CALL ObDereferenceObject_shim(PPCContext* ppc_state, KernelState* state) {
   SHIM_SET_RETURN_32(0);
 }
 
-SHIM_CALL NtDuplicateObject_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t handle = SHIM_GET_ARG_32(0);
-  uint32_t new_handle_ptr = SHIM_GET_ARG_32(1);
-  uint32_t options = SHIM_GET_ARG_32(2);
-
-  XELOGD("NtDuplicateObject(%.8X, %.8X, %.8X)", handle, new_handle_ptr,
-         options);
-
+dword_result_t NtDuplicateObject(dword_t handle, lpdword_t new_handle_ptr,
+                                 dword_t options) {
   // NOTE: new_handle_ptr can be zero to just close a handle.
   // NOTE: this function seems to be used to get the current thread handle
   //       (passed handle=-2).
-  // Because this function is not like the NT version (with cross process
-  // mumble), my guess is that it's just use for getting real handles.
-  // So we just fake it and properly reference count but not actually make
-  // different handles.
+  // This function actually just creates a new handle to the same object.
+  // Most games use it to get real handles to the current thread or whatever.
 
-  X_STATUS result = X_STATUS_INVALID_HANDLE;
+  X_HANDLE new_handle = X_INVALID_HANDLE_VALUE;
+  X_STATUS result =
+      kernel_state()->object_table()->DuplicateHandle(handle, &new_handle);
 
-  XObject* obj = 0;
-  result = state->object_table()->GetObject(handle, &obj);
-  if (XSUCCEEDED(result)) {
-    obj->RetainHandle();
-    uint32_t new_handle = obj->handle();
-    if (new_handle_ptr) {
-      SHIM_SET_MEM_32(new_handle_ptr, new_handle);
-    }
-
-    if (options == 1 /* DUPLICATE_CLOSE_SOURCE */) {
-      // Always close the source object.
-      state->object_table()->RemoveHandle(handle);
-    }
-    obj->Release();
+  if (new_handle_ptr) {
+    *new_handle_ptr = new_handle;
   }
 
-  SHIM_SET_RETURN_32(result);
+  if (options == 1 /* DUPLICATE_CLOSE_SOURCE */) {
+    // Always close the source object.
+    kernel_state()->object_table()->RemoveHandle(handle);
+  }
+
+  return result;
 }
+DECLARE_XBOXKRNL_EXPORT(NtDuplicateObject, ExportTag::kImplemented);
 
-SHIM_CALL NtClose_shim(PPCContext* ppc_state, KernelState* state) {
-  uint32_t handle = SHIM_GET_ARG_32(0);
-
-  XELOGD("NtClose(%.8X)", handle);
-
-  X_STATUS result = X_STATUS_INVALID_HANDLE;
-
-  result = state->object_table()->RemoveHandle(handle);
-
-  SHIM_SET_RETURN_32(result);
+dword_result_t NtClose(dword_t handle) {
+  return kernel_state()->object_table()->ReleaseHandle(handle);
 }
+DECLARE_XBOXKRNL_EXPORT(NtClose, ExportTag::kImplemented);
 
 }  // namespace kernel
 }  // namespace xe
 
-void xe::kernel::xboxkrnl::RegisterObExports(ExportResolver* export_resolver,
-                                             KernelState* state) {
+void xe::kernel::xboxkrnl::RegisterObExports(
+    xe::cpu::ExportResolver* export_resolver, KernelState* kernel_state) {
   SHIM_SET_MAPPING("xboxkrnl.exe", ObOpenObjectByName, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", ObReferenceObjectByHandle, state);
   SHIM_SET_MAPPING("xboxkrnl.exe", ObDereferenceObject, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", NtDuplicateObject, state);
-  SHIM_SET_MAPPING("xboxkrnl.exe", NtClose, state);
 }

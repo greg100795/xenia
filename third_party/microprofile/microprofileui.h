@@ -49,6 +49,8 @@
 #define MicroProfileSetDisplayMode(f) do{}while(0)
 #else
 
+#pragma warning(disable: 4244)  // implicit conversion from float -> int
+
 #ifndef MICROPROFILE_DRAWCURSOR
 #define MICROPROFILE_DRAWCURSOR 0
 #endif
@@ -2704,7 +2706,7 @@ void MicroProfileLoadPreset(const char* pSuffix)
       const char* pGroupName = pBuffer + Header.nGroups[i];
       for(uint32_t j = 0; j < MICROPROFILE_MAX_GROUPS; ++j)
       {
-        if(S.GroupInfo[j].pName && 0 == MP_STRCASECMP(pGroupName, S.GroupInfo[j].pName))
+        if(0 == MP_STRCASECMP(pGroupName, S.GroupInfo[j].pName))
         {
           S.nActiveGroupWanted |= (1ll << j);
         }

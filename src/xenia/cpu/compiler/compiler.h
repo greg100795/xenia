@@ -13,12 +13,12 @@
 #include <memory>
 #include <vector>
 
+#include "xenia/base/arena.h"
 #include "xenia/cpu/hir/hir_builder.h"
-#include "poly/arena.h"
 
 namespace xe {
 namespace cpu {
-class Runtime;
+class Processor;
 }  // namespace cpu
 }  // namespace xe
 
@@ -30,21 +30,21 @@ class CompilerPass;
 
 class Compiler {
  public:
-  Compiler(Runtime* runtime);
+  Compiler(Processor* processor);
   ~Compiler();
 
-  Runtime* runtime() const { return runtime_; }
-  poly::Arena* scratch_arena() { return &scratch_arena_; }
+  Processor* processor() const { return processor_; }
+  Arena* scratch_arena() { return &scratch_arena_; }
 
   void AddPass(std::unique_ptr<CompilerPass> pass);
 
   void Reset();
 
-  int Compile(hir::HIRBuilder* builder);
+  bool Compile(hir::HIRBuilder* builder);
 
  private:
-  Runtime* runtime_;
-  poly::Arena scratch_arena_;
+  Processor* processor_;
+  Arena scratch_arena_;
 
   std::vector<std::unique_ptr<CompilerPass>> passes_;
 };

@@ -13,30 +13,29 @@ namespace xe {
 namespace kernel {
 
 XSemaphore::XSemaphore(KernelState* kernel_state)
-    : XObject(kernel_state, kTypeSemaphore), handle_(NULL) {}
+    : XObject(kernel_state, kTypeSemaphore) {}
 
-XSemaphore::~XSemaphore() {
-  if (handle_) {
-    CloseHandle(handle_);
-  }
-}
+XSemaphore::~XSemaphore() = default;
 
 void XSemaphore::Initialize(int32_t initial_count, int32_t maximum_count) {
-  assert_null(handle_);
+  assert_false(semaphore_);
 
-  handle_ = CreateSemaphore(NULL, initial_count, maximum_count, NULL);
+  CreateNative(sizeof(X_KSEMAPHORE));
+
+  semaphore_ = xe::threading::Semaphore::Create(initial_count, maximum_count);
 }
 
-void XSemaphore::InitializeNative(void* native_ptr, DISPATCH_HEADER& header) {
-  assert_null(handle_);
+void XSemaphore::InitializeNative(void* native_ptr, X_DISPATCH_HEADER& header) {
+  assert_false(semaphore_);
 
-  // NOT IMPLEMENTED
-  // We expect Initialize to be called shortly.
+  auto semaphore = reinterpret_cast<X_KSEMAPHORE*>(native_ptr);
+  semaphore_ = xe::threading::Semaphore::Create(semaphore->header.signal_state,
+                                                semaphore->limit);
 }
 
 int32_t XSemaphore::ReleaseSemaphore(int32_t release_count) {
-  LONG previous_count = 0;
-  ::ReleaseSemaphore(handle_, release_count, &previous_count);
+  int32_t previous_count = 0;
+  semaphore_->Release(release_count, &previous_count);
   return previous_count;
 }
 

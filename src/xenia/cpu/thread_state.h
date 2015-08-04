@@ -12,57 +12,56 @@
 
 #include "xenia/cpu/frontend/ppc_context.h"
 #include "xenia/cpu/thread_state.h"
-#include "xenia/common.h"
 #include "xenia/memory.h"
-
-namespace xdb {
-namespace protocol {
-struct Registers;
-}  // namespace protocol
-}  // namespace xdb
 
 namespace xe {
 namespace cpu {
 
-class Runtime;
+class Processor;
+
+enum class ThreadStackType {
+  kKernelStack,
+  kUserStack,
+};
 
 class ThreadState {
  public:
-  ThreadState(Runtime* runtime, uint32_t thread_id, uint32_t stack_address,
-              uint32_t stack_size, uint32_t thread_state_address);
+  ThreadState(Processor* processor, uint32_t thread_id,
+              ThreadStackType stack_type, uint32_t stack_address,
+              uint32_t stack_size, uint32_t pcr_address);
   ~ThreadState();
 
-  Runtime* runtime() const { return runtime_; }
+  Processor* processor() const { return processor_; }
   Memory* memory() const { return memory_; }
   uint32_t thread_id() const { return thread_id_; }
+  ThreadStackType stack_type() const { return stack_type_; }
   const std::string& name() const { return name_; }
   void set_name(const std::string& value) { name_ = value; }
   void* backend_data() const { return backend_data_; }
   uint32_t stack_address() const { return stack_address_; }
-  size_t stack_size() const { return stack_size_; }
-  uint32_t thread_state_address() const { return thread_state_address_; }
+  uint32_t stack_size() const { return stack_size_; }
+  uint32_t stack_base() const { return stack_base_; }
+  uint32_t stack_limit() const { return stack_limit_; }
+  uint32_t pcr_address() const { return pcr_address_; }
   xe::cpu::frontend::PPCContext* context() const { return context_; }
-
-  int Suspend() { return Suspend(~0); }
-  int Suspend(uint32_t timeout_ms) { return 1; }
-  int Resume(bool force = false) { return 1; }
 
   static void Bind(ThreadState* thread_state);
   static ThreadState* Get();
   static uint32_t GetThreadID();
 
-  void WriteRegisters(xdb::protocol::Registers* registers);
-
  private:
-  Runtime* runtime_;
+  Processor* processor_;
   Memory* memory_;
   uint32_t thread_id_;
+  ThreadStackType stack_type_;
   std::string name_;
   void* backend_data_;
   uint32_t stack_address_;
   bool stack_allocated_;
   uint32_t stack_size_;
-  uint32_t thread_state_address_;
+  uint32_t stack_base_;
+  uint32_t stack_limit_;
+  uint32_t pcr_address_;
 
   // NOTE: must be 64b aligned for SSE ops.
   xe::cpu::frontend::PPCContext* context_;

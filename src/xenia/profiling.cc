@@ -7,7 +7,9 @@
  ******************************************************************************
  */
 
-#include "xenia/logging.h"
+#include "xenia/base/logging.h"
+
+#include <gflags/gflags.h>
 
 #define MICROPROFILE_ENABLED 1
 #define MICROPROFILEUI_ENABLED 1
@@ -16,7 +18,7 @@
 #define MICROPROFILE_PER_THREAD_BUFFER_SIZE (1024 * 1024 * 10)
 #define MICROPROFILE_USE_THREAD_NAME_CALLBACK 1
 #define MICROPROFILE_WEBSERVER_MAXFRAMES 3
-#define MICROPROFILE_PRINTF PLOGI
+#define MICROPROFILE_PRINTF XELOGI
 #define MICROPROFILE_WEBSERVER 1
 #define MICROPROFILE_DEBUG 0
 #if MICROPROFILE_WEBSERVER
@@ -27,11 +29,17 @@
 
 #include "xenia/profiling.h"
 
+DEFINE_bool(show_profiler, false, "Show profiling UI by default.");
+
 namespace xe {
 
 std::unique_ptr<ProfilerDisplay> Profiler::display_ = nullptr;
 
 #if XE_OPTION_PROFILING
+
+bool Profiler::is_enabled() { return true; }
+
+bool Profiler::is_visible() { return is_enabled() && MicroProfileIsDrawing(); }
 
 void Profiler::Initialize() {
   // Custom groups.
@@ -51,9 +59,11 @@ void Profiler::Initialize() {
 #if XE_OPTION_PROFILING_UI
   MicroProfileInitUI();
   g_MicroProfileUI.bShowSpikes = true;
-  g_MicroProfileUI.nOpacityBackground = 0x40 << 24;
-  g_MicroProfileUI.nOpacityForeground = 0xc0 << 24;
-  MicroProfileSetDisplayMode(1);
+  g_MicroProfileUI.nOpacityBackground = 0x40u << 24;
+  g_MicroProfileUI.nOpacityForeground = 0xc0u << 24;
+  if (FLAGS_show_profiler) {
+    MicroProfileSetDisplayMode(1);
+  }
 #else
   MicroProfileSetForceEnable(true);
   MicroProfileSetEnableAllGroups(true);
@@ -129,6 +139,10 @@ void Profiler::OnMouseWheel(int x, int y, int dy) {
   MicroProfileMousePosition(x, y, dy);
 }
 
+void Profiler::ToggleDisplay() { MicroProfileToggleDisplayMode(); }
+
+void Profiler::TogglePause() { MicroProfileTogglePause(); }
+
 #else
 
 void Profiler::OnMouseDown(bool left_button, bool right_button) {}
@@ -138,6 +152,10 @@ void Profiler::OnMouseUp() {}
 void Profiler::OnMouseMove(int x, int y) {}
 
 void Profiler::OnMouseWheel(int x, int y, int dy) {}
+
+void Profiler::ToggleDisplay() {}
+
+void Profiler::TogglePause() {}
 
 #endif  // XE_OPTION_PROFILING_UI
 
@@ -160,6 +178,8 @@ void Profiler::Present() {
 
 #else
 
+bool Profiler::is_enabled() { return false; }
+bool Profiler::is_visible() { return false; }
 void Profiler::Initialize() {}
 void Profiler::Dump() {}
 void Profiler::Shutdown() {}
